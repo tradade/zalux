@@ -8,8 +8,14 @@
   'use strict';
   if (window.__zaloBridge) return;
   const spec = window.__zaloBridgeSpec || { members: {}, values: {}, globals: [] };
-  const post = (msg) => window.webkit.messageHandlers.zbridge.postMessage(msg);
-  const log = (...a) => { try { window.webkit.messageHandlers.zlog.postMessage(a.map(String).join(' ').slice(0, 500)); } catch {} };
+  // The Linux shell keeps its own handler set (`__olazLinux.handler`): WebKitGTK's
+  // `window.webkit.messageHandlers` does not retain `zbridge` across loads, which
+  // left the renderer without an async bridge. WKWebView has no `__olazLinux`.
+  const handler = (name) =>
+    (window.__olazLinux && window.__olazLinux.handler && window.__olazLinux.handler(name)) ||
+    window.webkit.messageHandlers[name];
+  const post = (msg) => handler('zbridge').postMessage(msg);
+  const log = (...a) => { try { handler('zlog').postMessage(a.map(String).join(' ').slice(0, 500)); } catch {} };
 
   // Electron hands the renderer Uint8Array/ArrayBuffer through structured clone;
   // across WebKit message handlers we tag binary values as base64.

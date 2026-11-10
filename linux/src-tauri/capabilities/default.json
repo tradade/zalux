@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Olaz n'a pas d'API Tauri appelée par la page (le bridge passe par le serveur localhost), donc aucune permission n'est nécessaire.",
+  "windows": ["main"],
+  "permissions": []
+}

@@ -9,7 +9,12 @@
   if (window.__zaloNet) return;
   const native = { XHR: window.XMLHttpRequest, fetch: window.fetch.bind(window), WebSocket: window.WebSocket };
   window.__zaloNativeXHR = native.XHR; // bridge.js uses it for synchronous bridge calls
-  const bridge = (msg) => window.webkit.messageHandlers.znet.postMessage(msg);
+  // Same Linux-only handler lookup as bridge.js: WebKitGTK's platform bag is not a
+  // dependable place to keep the shell's handlers.
+  const handle = (name) =>
+    (window.__olazLinux && window.__olazLinux.handler && window.__olazLinux.handler(name)) ||
+    window.webkit.messageHandlers[name];
+  const bridge = (msg) => handle('znet').postMessage(msg);
   const isRemote = (url) => /^(https?|wss?):/i.test(String(url));
   const absolute = (url) => new URL(String(url), location.href).href;
 
