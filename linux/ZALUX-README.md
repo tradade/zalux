@@ -1,8 +1,9 @@
-# Zalux — bản dựng Olaz Linux
+# Zalux — Olaz Linux (source + bản dựng)
 
-Repo này chỉ chứa **bản dựng (AppImage)** của [Olaz Linux](../zalo-swift-re) —
-vỏ Tauri chạy renderer chính thức của Zalo PC trên Linux. Source code nằm ở
-repo nguồn; repo này chỉ phát hành file cài đặt.
+Repo này chứa **source của Olaz Linux** (vỏ Tauri chạy renderer chính thức của
+Zalo PC trên Linux) và **bản dựng AppImage** phát hành qua
+**[Releases](../../releases)**. Bản gốc macOS nằm ở
+[qnguyen3/zalo-swift-re](https://github.com/qnguyen3/zalo-swift-re).
 
 > **Unofficial project, không liên quan tới VNG.** "Zalo" là thương hiệu của
 > VNG. Dự án thuộc nhóm nghiên cứu tương thích / reverse-engineering; dùng
@@ -43,16 +44,16 @@ chmod +x Olaz-*-amd64.AppImage
 
 ## Bản dựng được tạo thế nào
 
-Workflow GitHub Actions trong repo nguồn
+Workflow GitHub Actions trong chính repo này
 (`.github/workflows/linux-release.yml`):
 
-1. Push tag `linux-v*` lên repo nguồn (hoặc chạy tay `workflow_dispatch`).
+1. Push tag `linux-v*` (hoặc chạy tay `workflow_dispatch`).
 2. Runner Ubuntu cài WebKitGTK 4.1 dev + Rust stable + Go, chạy
    `linux/scripts/build-appimage.sh` — build từ source, **không dùng artefact
    cục bộ**.
-3. AppImage + `SHA256SUMS` được đính lên release của repo này (tag cùng tên).
-   Workflow cần secret `ZALUX_RELEASE_TOKEN` (PAT có quyền Contents: write
-   trên repo này) — chỉ maintainer của repo nguồn cần cấu hình một lần.
+3. AppImage + `SHA256SUMS` đính lên **Releases** của repo này (tag cùng tên)
+   qua `GITHUB_TOKEN` — không cần PAT. Muốn phát hành sang repo khác, đặt
+   env `DIST_REPO` + secret `ZALUX_RELEASE_TOKEN`.
 
 Mỗi release ghi rõ nguồn build (repo@commit) — ai cũng tái hiện được bằng
 cùng một script.

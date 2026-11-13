@@ -1,15 +1,15 @@
-# Builds the Linux AppImage and attaches it to a release in the distribution
-# repository (tradade/zalux by default).
+# Builds the Linux AppImage and attaches it to a release.
 #
 # Triggers:
-#   * push a tag  `linux-v*`          → build + create/update the release on the
-#                                       distribution repo under the same tag
+#   * push a tag  `linux-v*`          → build + create/update the release under
+#                                       the same tag
 #   * workflow_dispatch (manual)      → build only; the AppImage lands in the
 #                                       job artifacts for testing
 #
-# One secret is required for the release job:
-#   ZALUX_RELEASE_TOKEN — a personal access token (classic, `repo` scope, or a
-#   fine-grained token with Contents: read/write on the distribution repo).
+# Release target: the repository running this workflow by default (the built-in
+# GITHUB_TOKEN is enough). To publish into a different repo instead, set the
+# DIST_REPO env below and add a `ZALUX_RELEASE_TOKEN` secret (PAT with
+# Contents: read/write on that repository).
 
 name: linux-release
 
@@ -28,7 +28,7 @@ permissions:
   contents: read
 
 env:
-  DIST_REPO: tradade/zalux
+  DIST_REPO: ${{ github.repository }}
 
 jobs:
   build:
@@ -90,17 +90,19 @@ jobs:
     # Chỉ tạo release khi chạy theo tag — bản workflow_dispatch ở lại artefact.
     if: startsWith(github.ref, 'refs/tags/linux-v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: ${{ needs.build.outputs.artifact }}
           path: out
 
-      - name: Tạo release trên repo phân phối
+      - name: Tạo release
         uses: softprops/action-gh-release@v2
         with:
           repository: ${{ env.DIST_REPO }}
-          token: ${{ secrets.ZALUX_RELEASE_TOKEN }}
+          token: ${{ secrets.ZALUX_RELEASE_TOKEN || github.token }}
           tag_name: ${{ github.ref_name }}
           name: Olaz Linux ${{ github.ref_name }}
           fail_on_unmatched_files: true
