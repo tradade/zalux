@@ -102,6 +102,9 @@ fn main() {
 
     tauri::Builder::default()
         .setup(move |app| {
+            // Window-control IPC (`minimize`, `toggle-maximize`, …) and
+            // notification clicks drive the real window through this handle.
+            ctx.bridge.set_app_handle(app.handle().clone());
             tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::External(url.parse()?))
                 .title("Olaz")
                 .inner_size(1100.0, 720.0)
