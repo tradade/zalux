@@ -1343,6 +1343,27 @@ return JSON.stringify({ cancelled: true, running: m2.isSyncRunning() });
                     if ctx.debug {
                         eprintln!("[state] {}", truncate(&payload.to_string(), 400));
                     }
+                    // The notification shim reports readiness and asks for the
+                    // permission the way it expects the native host to answer
+                    // (macOS: UNUserNotificationCenter). Grant it immediately —
+                    // desktop notifications are user-approved by the OS daemon.
+                    let granted = json!({
+                        "kind": "js",
+                        "target": "main",
+                        "code": "try{window.__zaloNotification&&window.__zaloNotification.setPermission('granted');window.__zaloNotification.permissionResult&&window.__zaloNotification.permissionResult('granted');}catch(e){}"
+                    });
+                    let kind = payload
+                        .get("notification")
+                        .and_then(|n| n.get("kind"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if kind == "ready" || kind == "requestPermission" {
+                        ctx.events.push_control(
+                            u64::MAX - kind.len() as u64,
+                            "main",
+                            granted,
+                        );
+                    }
                     reply(request, 200, "application/json", json!({ "ok": true, "value": null }).to_string());
                 }
                 other => {

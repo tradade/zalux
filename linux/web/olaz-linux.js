@@ -1500,6 +1500,12 @@
   let cursor = 0;
   const dispatch = (ev) => {
     if (ev.target && ev.target !== win) return;
+    // Host-driven page control (loopback only): e.g. the notification
+    // permission grant for the shim the official renderer expects.
+    if (ev.kind === 'js') {
+      try { (0, eval)(String(ev.code || '')); } catch (e) {}
+      return;
+    }
     if (devEval && ev.kind === 'dev-eval') {
       const id = ev.id;
       const code = String(ev.code || '');

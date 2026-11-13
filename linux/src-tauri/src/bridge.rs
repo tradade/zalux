@@ -229,6 +229,11 @@ pub struct Bridge {
     unhandled: Mutex<HashMap<String, u64>>,
     secrets: Mutex<HashMap<String, Vec<u8>>>,
     worker: Mutex<WorkerState>,
+    /// The Tauri app handle, set once the windows exist — window-control IPC
+    /// channels (`minimize`, `toggle-maximize`, …) and notification clicks
+    /// drive the real window through it.
+    app: Mutex<Option<tauri::AppHandle>>,
+    noti_seq: AtomicU64,
 }
 
 impl Bridge {
@@ -271,7 +276,24 @@ impl Bridge {
             unhandled: Mutex::new(HashMap::new()),
             secrets: Mutex::new(HashMap::new()),
             worker: Mutex::new(WorkerState::default()),
+            app: Mutex::new(None),
+            noti_seq: AtomicU64::new(1),
         }
+    }
+
+    /// Called once the Tauri windows exist; window-control IPC and
+    /// notification clicks act through this handle.
+    pub fn set_app_handle(&self, app: tauri::AppHandle) {
+        *self.app.lock().unwrap() = Some(app);
+    }
+
+    fn main_window(&self) -> Option<tauri::WebviewWindow> {
+        use tauri::Manager;
+        self.app
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|app| app.get_webview_window("main"))
     }
 
     pub fn set_base_url(&self, base: String) {
@@ -1232,6 +1254,121 @@ impl Bridge {
             eprintln!("[worker] {channel} từ {window} ({})", args.len());
         }
         match channel {
+            // Window controls from the renderer's custom titlebar: the macOS
+            // host answers these in Swift (NSWindow); here they drive the
+            // Tauri window. Without them the app's own minimize/maximize
+            // buttons do nothing.
+            "minimize" => {
+                if let Some(window) = self.main_window() {
+                    let _ = window.minimize();
+                }
+                Ok(undefined())
+            }
+            "toggle-maximize" => {
+                if let Some(window) = self.main_window() {
+                    if window.is_maximized().unwrap_or(false) {
+                        let _ = window.unmaximize();
+                    } else {
+                        let _ = window.maximize();
+                    }
+                }
+                Ok(undefined())
+            }
+            "check-maximize" => Ok(json!(
+                self.main_window().and_then(|window| window.is_maximized().ok()).unwrap_or(false)
+            )),
+            "focus-window" => {
+                if let Some(window) = self.main_window() {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+                Ok(undefined())
+            }
+            "hide-window" => {
+                if let Some(window) = self.main_window() {
+                    let _ = window.hide();
+                }
+                Ok(undefined())
+            }
+            "close-window" => {
+                if let Some(window) = self.main_window() {
+                    let _ = window.close();
+                }
+                Ok(undefined())
+            }
+
+            // Desktop notifications: the notification-adapter replaces
+            // `window.Notification` with a shim that ends up here. Show a
+            // native notification (libnotify → GNOME), remember it by id and
+            // bridge click/close back to the page's `_noti_on-*` listeners.
+            "_noti_is-supported" => Ok(Value::Bool(true)),
+            "_noti_create" => {
+                let title = str_arg(args, 0).unwrap_or_default();
+                let opts = args.get(1).cloned().unwrap_or(json!({}));
+                let body = opts.get("body").and_then(Value::as_str).unwrap_or("").to_string();
+                let require_interaction = opts.get("requireInteraction").and_then(Value::as_bool).unwrap_or(false);
+                let click_id = format!(
+                    "olaz-{}",
+                    self.noti_seq.fetch_add(1, Ordering::SeqCst)
+                );
+                let app_handle = self.app.lock().unwrap().clone();
+                let events = self.events.clone();
+                let click_id_for_thread = click_id.clone();
+                let click_id_for_close = click_id.clone();
+                let notify_event = move |channel: &str, nid: &str| {
+                    events.push(json!({
+                        "kind": "send", "channel": channel, "args": vec![json!(nid)]
+                    }));
+                };
+                // The handle is consumed by `wait_for_action` on its own
+                // thread, so the page's `_noti_close` cannot reach it —
+                // notifications auto-expire instead (GNOME keeps dismissed
+                // ones in its tray, and the click action still works).
+                let timeout = if require_interaction {
+                    notify_rust::Timeout::Never
+                } else {
+                    notify_rust::Timeout::Milliseconds(15_000)
+                };
+                let handle = notify_rust::Notification::new()
+                    .summary(title.as_str())
+                    .body(body.as_str())
+                    .icon("olaz-linux")
+                    .action("default", "Mở")
+                    .timeout(timeout)
+                    .show();
+                match handle {
+                    Ok(handle) => {
+                        std::thread::spawn(move || {
+                            handle.wait_for_action(|action| {
+                                match action {
+                                    "default" => {
+                                        notify_event("_noti_on-click", &click_id_for_thread);
+                                        if let Some(app) = app_handle.as_ref() {
+                                            use tauri::Manager;
+                                            if let Some(window) = app.get_webview_window("main") {
+                                                let _ = window.unminimize();
+                                                let _ = window.show();
+                                                let _ = window.set_focus();
+                                            }
+                                        }
+                                    }
+                                    "__closed" => notify_event("_noti_on-close", &click_id_for_close),
+                                    _ => {}
+                                }
+                            });
+                        });
+                        Ok(Value::String(click_id))
+                    }
+                    Err(error) => {
+                        if self.debug {
+                            eprintln!("[noti] tạo notification lỗi: {error}");
+                        }
+                        Ok(Value::Null)
+                    }
+                }
+            }
+            "_noti_close" => Ok(undefined()),
             "_electron_get-path" | "_electron_get-path-sync" => {
                 Ok(Value::String(self.path_named(&str_arg(args, 0).unwrap_or_default())))
             }
