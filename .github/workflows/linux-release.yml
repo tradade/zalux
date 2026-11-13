@@ -1,0 +1,119 @@
+# Builds the Linux AppImage and attaches it to a release in the distribution
+# repository (tradade/zalux by default).
+#
+# Triggers:
+#   * push a tag  `linux-v*`          → build + create/update the release on the
+#                                       distribution repo under the same tag
+#   * workflow_dispatch (manual)      → build only; the AppImage lands in the
+#                                       job artifacts for testing
+#
+# One secret is required for the release job:
+#   ZALUX_RELEASE_TOKEN — a personal access token (classic, `repo` scope, or a
+#   fine-grained token with Contents: read/write on the distribution repo).
+
+name: linux-release
+
+on:
+  push:
+    tags:
+      - 'linux-v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Source ref to build (branch/commit). Mặc định: ref kích hoạt'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  DIST_REPO: tradade/zalux
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    outputs:
+      artifact: ${{ steps.collect.outputs.artifact }}
+    steps:
+      - name: Checkout nguồn
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: linux/src-tauri
+
+      - name: Go (fingerprint helper)
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Phụ thuộc hệ thống (Tauri v2 / WebKitGTK 4.1)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libxdo-dev libssl-dev \
+            build-essential curl wget file patchelf
+
+      - name: Build AppImage
+        working-directory: linux
+        run: ./scripts/build-appimage.sh
+
+      - name: Thu thập artefact + checksum
+        id: collect
+        run: |
+          mkdir -p out
+          src=$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' | head -n 1)
+          test -n "$src" || { echo 'không tìm thấy AppImage sau build' >&2; exit 1; }
+          name="Olaz-${GITHUB_REF_NAME}-amd64.AppImage"
+          cp "$src" "out/$name"
+          sha256sum "out/$name" > out/SHA256SUMS
+          echo "ARTIFACT_NAME=$name" >> "$GITHUB_ENV"
+          echo "artifact=$name" >> "$GITHUB_OUTPUT"
+          cat out/SHA256SUMS
+
+      - name: Upload artefact (mọi lần chạy)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: out/
+
+  release:
+    needs: build
+    # Chỉ tạo release khi chạy theo tag — bản workflow_dispatch ở lại artefact.
+    if: startsWith(github.ref, 'refs/tags/linux-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: out
+
+      - name: Tạo release trên repo phân phối
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.DIST_REPO }}
+          token: ${{ secrets.ZALUX_RELEASE_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          name: Olaz Linux ${{ github.ref_name }}
+          fail_on_unmatched_files: true
+          body: |
+            Olaz Linux — bản dựng chính thức của tag `${{ github.ref_name }}`.
+
+            - Nguồn: `${{ github.repository }}@${{ github.sha }}`
+            - Kiểm tra toàn vẹn: xem `SHA256SUMS` (`sha256sum -c SHA256SUMS`)
+            - Lần chạy đầu app tự tải runtime Zalo PC từ VNG (~323 MB) và
+              kiểm tra SHA-256 của bản ghim — repo này không phân phối code VNG.
+
+            **Unofficial project, không liên quan tới VNG.** Dùng với tài khoản
+            của bạn và tự chịu rủi ro theo ToS của Zalo.
+          files: |
+            out/*.AppImage
+            out/SHA256SUMS

@@ -4,6 +4,14 @@ Bản chạy Olaz trên Linux: một cửa sổ Tauri (WebKitGTK) chứa **rende
 (`app.asar`, do chính VNG phát hành), cộng với phần mà Electron's preload/main từng cung cấp —
 bridge `$z*`, proxy mạng, cookie, lưu trữ — viết lại bằng Rust.
 
+## Tải bản dựng sẵn
+
+AppImage chính thức được build tự động và phát hành tại
+**[tradade/zalux — Releases](https://github.com/tradade/zalux/releases)** (kèm `SHA256SUMS`).
+Push tag `linux-v*` lên repo này là workflow
+[`.github/workflows/linux-release.yml`](../.github/workflows/linux-release.yml) build và
+đăng release tự động — chi tiết xem [`ZALUX-README.md`](ZALUX-README.md).
+
 Đây là bản port của [bản macOS](../README.md), không phải bản viết lại giao diện: 20 host script
 trong `Sources/Olaz/HostScripts/` được nhúng nguyên văn và chạy không sửa một dòng nào.
 
