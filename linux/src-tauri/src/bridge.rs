@@ -60,6 +60,11 @@ const MEMBERS: &[(&str, &str)] = &[
     ("$zelectronNative.clipboardText", "sync"),
     ("$zelectronNative.clipboardWriteText", "sync"),
     ("$zelectronNative.clipboardFormats", "sync"),
+    ("$olaz.jxl.decode", "async"),
+    ("$olaz.jxl.info", "async"),
+    ("$olaz.photo.cache", "async"),
+    ("$zFeatures.mainless.execRaw", "async"),
+    ("$zFeatures.genThumb.writeSavePathFilePhoto", "async"),
     ("$zFileManager.getSentryConfig", "sync"),
     ("$zFileManager.saveSentryConfig", "async"),
     ("$zFileManager.getViewerkey", "async"),
@@ -185,10 +190,22 @@ struct WorkerState {
     ready: bool,
     /// task type → window that registered it (`main` / `shared-worker`)
     handlers: HashMap<String, String>,
-    /// request id → (window that asked, window that runs it)
-    pending: HashMap<String, (String, String)>,
+    /// Routed task key → the window that asked, the window that runs it, and
+    /// the requester's original id. The key is prefixed with the requester
+    /// because main and the shared worker both number their own tasks from 1.
+    pending: HashMap<String, PendingTask>,
     last_remote_config: Option<Value>,
     viewer_key: Option<Value>,
+}
+
+#[derive(Clone)]
+struct PendingTask {
+    requester: String,
+    handler: String,
+    request_id: Value,
+    task_type: String,
+    /// When the task was handed to the handler, so a reply can say how long it took.
+    started: std::time::Instant,
 }
 
 pub struct Bridge {
@@ -497,6 +514,7 @@ impl Bridge {
 
     /// Path-keyed members (the ones `local-modules.js` does not implement itself).
     fn member(&self, path: &str, args: &[Value], sync: bool) -> Result<Value, String> {
+        trace_call(path, args);
         match path {
             "$zelectron.storeRead" => Ok(self.store_read(&str_arg(args, 0).unwrap_or_default())),
             "$zelectron.storeWrite" => {
@@ -652,6 +670,34 @@ impl Bridge {
                 let encoded = str_arg(args, 3);
                 Ok(encode_digest(&hash_digest(&alg, &data)?, encoded.as_deref()))
             }
+            // Renderer-side JPEG XL decode: Zalo's photo component calls
+            // `$zFeatures.libjxl.decodeToJpeg`, which is a native addon that
+            // ships only for macOS/Windows. Linux answers with `jxl-oxide` so a
+            // message photo can reach an `<img>` instead of being dropped.
+            "$olaz.jxl.decode" => {
+                let data = arg_bytes(args, 0).ok_or_else(|| "jxl: thiếu dữ liệu".to_string())?;
+                let quality = int_arg(args, 1).unwrap_or(90).clamp(1, 100) as u8;
+                // Already a JPEG (the download manager rewrites photo files): hand it back
+                // untouched so both photo paths keep working.
+                let jpeg = if crate::download::is_jxl(&data) {
+                    crate::download::jxl_to_jpeg(&data, quality)
+                        .ok_or_else(|| "jxl: không giải mã được".to_string())?
+                } else {
+                    data
+                };
+                Ok(bytes_out(jpeg, true))
+            }
+            "$olaz.jxl.info" => {
+                let data = arg_bytes(args, 0).ok_or_else(|| "jxl: thiếu dữ liệu".to_string())?;
+                crate::download::jxl_size(&data)
+                    .map(|(width, height)| json!({ "width": width, "height": height }))
+                    .ok_or_else(|| "jxl: không đọc được kích thước".to_string())
+            }
+            // The photo bubble's `<img>` only loads a cached file; its bytes otherwise
+            // come from the official multi-source downloader, whose module chain fails
+            // on Linux (`resolveMedia` → reason 'error'). Fetching the CDN copy here is
+            // the fallback that turns a blurred LQIP into the real photo.
+            "$olaz.photo.cache" => self.cache_photo(&args.first().cloned().unwrap_or(Value::Null)),
             "$znode.crypto.randomBytes" => {
                 let count = int_arg(args, 0).unwrap_or(0).max(0) as usize;
                 let mut bytes = vec![0u8; count];
@@ -978,6 +1024,169 @@ impl Bridge {
         result.map(|_| undefined()).map_err(|error| io_error(&error, &display))
     }
 
+    /// `$zFeatures.genThumb.writeSavePathFilePhoto` — where the preload would write
+    /// the generated thumbnail with `fs.createWriteStream`, which WebKitGTK has no
+    /// Node stream for. The photo bubble's first cache candidate is
+    /// `<ZaloDownloads>/resource/<conv>/fileThumb/<checksum>.jpg`, so that is what
+    /// gets written; returning its path is what lets the bubble swap its LQIP for
+    /// the real `<img>`.
+    fn write_thumb(
+        &self,
+        user_id: &str,
+        name: &str,
+        bytes: &[u8],
+        message: &Value,
+    ) -> Result<Value, String> {
+        let to_uid = match message.get("toUid") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Number(number)) => number.to_string(),
+            _ => String::new(),
+        };
+        let (user_id, to_uid) = (path_component(user_id), path_component(&to_uid));
+        let file = path_component(name);
+        if user_id.is_empty() || to_uid.is_empty() || file.is_empty() {
+            return Err("EINVAL: thumbnail thiếu userId/toUid/checksum".into());
+        }
+        // `<share>/olaz/ZaloPC/<ownId>/ZaloDownloads/resource/<conv>/…` — where the
+        // renderer already keeps synced photos, so the cache check finds this too.
+        let zalo_pc = bridge_zalo_pc(&self.userdata);
+        let dir = zalo_pc
+            .join(&user_id)
+            .join("ZaloDownloads")
+            .join("resource")
+            .join(&to_uid)
+            .join("fileThumb");
+        let path = dir.join(format!("{file}.jpg"));
+        let display = path.display().to_string();
+        std::fs::create_dir_all(&dir).map_err(|error| io_error(&error, &display))?;
+        let jpeg = if crate::download::is_jxl(bytes) {
+            crate::download::jxl_to_jpeg(bytes, 88)
+                .ok_or_else(|| format!("EINVAL: không giải mã được jxl ({display})"))?
+        } else {
+            bytes.to_vec()
+        };
+        std::fs::write(&path, &jpeg).map_err(|error| io_error(&error, &display))?;
+        Ok(Value::String(display))
+    }
+
+    /// `$olaz.photo.cache` — download one message photo and write the four
+    /// `resource/<conv>/Cache/<stem>_t|_n|_h|_o` variants the bubble probes.
+    /// The official `loadPC` downloader throws inside its module chain here, so a
+    /// photo that never downloaded keeps its placeholder even though its CDN URL is
+    /// known. Returns `{state:'cached'}` when the files were already there.
+    fn cache_photo(&self, request: &Value) -> Result<Value, String> {
+        let url = request
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let stem = path_component(request.get("stem").and_then(Value::as_str).unwrap_or_default());
+        let conv = path_component(request.get("convId").and_then(Value::as_str).unwrap_or_default());
+        if !url.starts_with("https://") || stem.is_empty() || conv.is_empty() {
+            return Err("EINVAL: photo.cache cần https url + stem + convId".into());
+        }
+        let user = request
+            .get("userId")
+            .and_then(Value::as_str)
+            .map(path_component)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                self.session
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|session| session.get("userId").and_then(Value::as_str))
+                    .map(path_component)
+                    .filter(|value| !value.is_empty())
+            })
+            .ok_or_else(|| "ENOSESSION: photo.cache chưa biết userId".to_string())?;
+        let zalo_pc = bridge_zalo_pc(&self.userdata);
+        let resource = zalo_pc
+            .join(&user)
+            .join("ZaloDownloads")
+            .join("resource")
+            .join(&conv);
+        // Each quality has its own cache path: the thumbnail is `<stem>_t<ext>` under
+        // `Cache/`, every other quality folds `md5(url)` in under `picture/`. The caller
+        // sends the quality→URL map so each file lands where the renderer probes.
+        let qualities = request
+            .get("qualities")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|entry| {
+                        let pair = entry.as_array()?;
+                        let quality = pair.first()?.as_str()?.to_string();
+                        let value = pair.get(1)?.as_str()?.to_string();
+                        (value.starts_with("https://")).then_some((quality, value))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|list| !list.is_empty())
+            .unwrap_or_else(|| vec![("thumbUrl".to_string(), url.clone())]);
+        let variants =
+            crate::download::photo_variant_paths(&resource, &stem, &qualities);
+        let present = variants
+            .iter()
+            .all(|path| std::fs::metadata(path).map(|meta| meta.len() > 0).unwrap_or(false));
+        if present {
+            return Ok(Self::photo_cache_reply("cached", &variants));
+        }
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+                 Chrome/108.0.0.0 Safari/537.36",
+            )
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|error| format!("ENET: {error}"))?;
+        let response = client
+            .get(&url)
+            .header("referer", "https://chat.zalo.me/")
+            .send()
+            .map_err(|error| format!("ENET: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("EHTTP {}: {}", status.as_u16(), url));
+        }
+        let bytes = response
+            .bytes()
+            .map_err(|error| format!("ENET: {error}"))?
+            .to_vec();
+        if bytes.is_empty() {
+            return Err("EEMPTY: ảnh rỗng".into());
+        }
+        let files = crate::download::write_photo_cache(&resource, &stem, &qualities, &bytes)
+            .ok_or_else(|| "EDECODE: không giải mã được ảnh".to_string())?;
+        if self.debug {
+            eprintln!(
+                "[photo] {conv} {stem} {} B → {}",
+                bytes.len(),
+                files.last().map(|p| p.display().to_string()).unwrap_or_default()
+            );
+        }
+        Ok({
+            let mut reply = Self::photo_cache_reply("ok", &files);
+            reply["bytes"] = Value::from(bytes.len() as u64);
+            reply
+        })
+    }
+
+    /// Reply shape for `$olaz.photo.cache`: `{state, path, paths}` — `path` is the
+    /// full-quality variant for callers that just open one file, `paths` carries
+    /// all four cache entries (`_t|_n|_h|_o`) for callers that choose.
+    fn photo_cache_reply(state: &str, files: &[std::path::PathBuf]) -> Value {
+        let best = files.get(3).or_else(|| files.first());
+        json!({
+            "state": state,
+            "path": best.map(|path| path.display().to_string()).unwrap_or_default(),
+            "paths": files
+                .iter()
+                .map(|path| Value::String(path.display().to_string()))
+                .collect::<Vec<_>>(),
+        })
+    }
+
     // ---------------------------------------------------------------- electron-store
 
     fn store_path(&self, name: &str) -> String {
@@ -1013,6 +1222,7 @@ impl Bridge {
 
     /// `ipcRenderer.invoke/send/sendSync` — this plays Electron's main process.
     fn channel(&self, channel: &str, args: &[Value], sync: bool, window: &str) -> Result<Value, String> {
+        trace_call(channel, args);
         // Which window asked is the whole point of the task router; names only,
         // never payloads (same policy as the rest of OLAZ_DEBUG logging).
         if self.debug && (channel.starts_with("db-") || channel == "new-session" || channel == "login-success") {
@@ -1054,6 +1264,24 @@ impl Bridge {
             "trust_path_from_blob" | "request_flush_zlog" | "set_readonly_file" => Ok(undefined()),
             "verify_zalo_pc_hardlink_support" => Ok(Value::Bool(true)),
 
+            // Photo thumbnails. The bubble asks for a cached thumb first; when none
+            // exists it decodes the message photo in the mainless worker, checks the
+            // md5, then writes a JPEG next to the conversation. macOS runs those in
+            // `mainless-worker.js`; both tasks are plain image work, so they live here.
+            "exec_raw" => {
+                exec_raw(&str_arg(args, 0).unwrap_or_default(), args.get(1).cloned().unwrap_or(Value::Null))
+            }
+            "gen-thumb_write-savepath-file-photo" => {
+                let bytes = arg_bytes(args, 2)
+                    .ok_or_else(|| "EINVAL: thiếu buffer thumbnail".to_string())?;
+                self.write_thumb(
+                    &str_arg(args, 0).unwrap_or_default(),
+                    &str_arg(args, 1).unwrap_or_default(),
+                    &bytes,
+                    &args.get(3).cloned().unwrap_or(Value::Null),
+                )
+            }
+
             "sqlite-available" => Ok(Value::Bool(false)),
             "fail-load-sqlite3" => Ok(Value::Bool(true)),
             "is-migrate-full-done" => Ok(Value::Bool(false)),
@@ -1063,6 +1291,28 @@ impl Bridge {
             "migratedb:signal_restart" | "migratedb:signal_done" => Ok(undefined()),
             "z-db-corruption-detector" => Ok(json!(0)),
             "get-name-of-target-script-for-dal-channel-from-host" => Ok(Value::String("preload-sqlite".into())),
+
+            // Media downloads. The official loader (`CloudService.downloadWithMultiSrc`: the
+            // photo `loadPC`, video, files, and the Zalo Cloud fallback behind them) calls
+            // `$zdownload.sendDownloadRequest` and waits for a `new-download-file-resp` push on
+            // this same channel. Electron main answered it; with no answer every image stays
+            // unresolved and ZaloDownloads never receives a file.
+            "new-download-channel" => {
+                if let Some(request) = args.first() {
+                    crate::download::request(
+                        self.events.clone(),
+                        self.jar.clone(),
+                        self.client_version_ua(),
+                        self.debug,
+                        request,
+                    );
+                }
+                Ok(undefined())
+            }
+            // Download config / extension filter: acknowledged, nothing to schedule.
+            "download-config-change" | "invalid-file-exts-change" => Ok(undefined()),
+            // Full-screen photo viewer page (`$zresource.getPhotoviewerUrl`).
+            "get-photo-viewer-url" => Ok(Value::String(format!("{}/app/popup-viewer.html", self.base_url()))),
 
             // Page transitions main used to perform.
             "login-success" => {
@@ -1083,8 +1333,26 @@ impl Bridge {
             }
 
             // Session / database plumbing (ZaloMainProcess on macOS).
+            // Every page announces itself on load. Replay the stored session so a
+            // page that subscribed after the last broadcast (the hidden shared
+            // worker) still runs SecureLocalStorage.init(userId, UIN).
+            "renderer-ready" => {
+                let session = self.session.lock().unwrap().clone();
+                if let Some(session) = session {
+                    self.push("new-session", &[session]);
+                }
+                Ok(undefined())
+            }
             "new-session" => {
-                *self.session.lock().unwrap() = args.first().cloned();
+                let session = args.first().cloned().unwrap_or(Value::Null);
+                *self.session.lock().unwrap() = Some(session.clone());
+                // Electron's main broadcast the session back after `authenticate`;
+                // the renderer's session-manager listens on this same channel and only
+                // then dispatches `Authenticating`, where SecureLocalStorage is
+                // initialised with the session UIN (its cipher key). Without the echo
+                // the storage stays locked and every secure item read throws
+                // "SecureLocalStorage instance hasn't been initialized yet!".
+                self.push("new-session", &[session]);
                 Ok(undefined())
             }
             "db-authenticated" => {
@@ -1136,6 +1404,9 @@ impl Bridge {
                 if task_type.is_empty() {
                     return Ok(undefined());
                 }
+                if self.debug {
+                    eprintln!("[worker] shared-worker-handle {task_type} từ {window}");
+                }
                 let replay = {
                     let mut worker = self.worker.lock().unwrap();
                     worker.handlers.insert(task_type, window.to_string());
@@ -1156,7 +1427,11 @@ impl Bridge {
                     return Ok(undefined());
                 };
                 let request_id = task.get("id").cloned().unwrap_or(Value::Null);
-                let id = id_string(&request_id);
+                // Task ids are only unique inside one renderer; both main and
+                // the hidden worker start at 1. Prefix with the sender, like
+                // Electron's sharedWorkerManager, so a response cannot be routed
+                // to the other window's task with the same numeric id.
+                let key = format!("{window}:{}", id_string(&request_id));
                 let task_type = task.get("type").and_then(|value| value.as_str()).unwrap_or_default().to_string();
                 let handler = {
                     let mut worker = self.worker.lock().unwrap();
@@ -1164,13 +1439,32 @@ impl Bridge {
                         None
                     } else {
                         worker.handlers.get(&task_type).cloned().map(|handler| {
-                            worker.pending.insert(id, (window.to_string(), handler.clone()));
+                            worker.pending.insert(
+                                key.clone(),
+                                PendingTask {
+                                    requester: window.to_string(),
+                                    handler: handler.clone(),
+                                    request_id: request_id.clone(),
+                                    task_type: task_type.clone(),
+                                    started: std::time::Instant::now(),
+                                },
+                            );
                             handler
                         })
                     }
                 };
+                if self.debug {
+                    eprintln!(
+                        "[worker] shared-worker-run {task_type} từ {window} → {}",
+                        if handler.is_some() { "handler" } else { "unsupported" }
+                    );
+                }
                 match handler {
-                    Some(handler) => self.push_to(&handler, "shared-worker-run", &[Value::Object(task.clone())]),
+                    Some(handler) => {
+                        let mut routed = task.clone();
+                        routed.insert("id".to_string(), Value::String(key));
+                        self.push_to(&handler, "shared-worker-run", &[Value::Object(routed)]);
+                    }
                     None => {
                         let error = if self.worker.lock().unwrap().ready {
                             "Task type is not supported"
@@ -1184,42 +1478,82 @@ impl Bridge {
             }
             "shared-worker-resp" => {
                 let Some(message) = args.first() else { return Ok(undefined()) };
-                let id = message.get("id").map(id_string).unwrap_or_default();
-                let requester = self.worker.lock().unwrap().pending.remove(&id).map(|(requester, _)| requester);
-                if let Some(requester) = requester {
-                    self.push_to(&requester, "shared-worker-resp", &[message.clone()]);
+                let key = message.get("id").map(id_string).unwrap_or_default();
+                let entry = self.worker.lock().unwrap().pending.remove(&key);
+                if let Some(entry) = entry {
+                    if self.debug {
+                        let elapsed = entry.started.elapsed().as_millis();
+                        let error = message.get("error").map(|value| value.to_string());
+                        match error {
+                            Some(error) => eprintln!(
+                                "[worker] shared-worker-resp {} sau {elapsed} ms error={}",
+                                entry.task_type,
+                                error.chars().take(180).collect::<String>()
+                            ),
+                            None => eprintln!(
+                                "[worker] shared-worker-resp {} sau {elapsed} ms"
+                                , entry.task_type
+                            ),
+                        }
+                    }
+                    let mut routed = message.clone();
+                    if let Some(object) = routed.as_object_mut() {
+                        object.insert("id".to_string(), entry.request_id);
+                    }
+                    self.push_to(&entry.requester, "shared-worker-resp", &[routed]);
+                } else if self.debug {
+                    // A reply that arrives after the caller gave up (or for another sender) is
+                    // invisible otherwise; it is the difference between "slow" and "lost".
+                    eprintln!("[worker] shared-worker-resp bỏ qua task không chờ: {key}");
                 }
                 Ok(undefined())
             }
             "shared-worker-progress" => {
                 let Some(message) = args.first() else { return Ok(undefined()) };
-                let id = message.get("id").map(id_string).unwrap_or_default();
-                let requester = self.worker.lock().unwrap().pending.get(&id).map(|(requester, _)| requester.clone());
-                if let Some(requester) = requester {
-                    self.push_to(&requester, "shared-worker-progress", &[message.clone()]);
+                let key = message.get("id").map(id_string).unwrap_or_default();
+                let entry = self.worker.lock().unwrap().pending.get(&key).cloned();
+                if let Some(entry) = entry {
+                    let mut routed = message.clone();
+                    if let Some(object) = routed.as_object_mut() {
+                        object.insert("id".to_string(), entry.request_id);
+                        object
+                            .entry("type".to_string())
+                            .or_insert(Value::String(entry.task_type));
+                    }
+                    self.push_to(&entry.requester, "shared-worker-progress", &[routed]);
                 }
                 Ok(undefined())
             }
             "shared-worker-abort" => {
                 let Some(message) = args.first() else { return Ok(undefined()) };
-                let id = message.get("id").map(id_string).unwrap_or_default();
-                let entry = self.worker.lock().unwrap().pending.remove(&id);
-                if let Some((requester, handler)) = entry {
-                    self.push_to(&handler, "shared-worker-abort", &[json!({ "id": id })]);
+                let key = format!(
+                    "{window}:{}",
+                    message.get("id").map(id_string).unwrap_or_default()
+                );
+                let entry = self.worker.lock().unwrap().pending.remove(&key);
+                if let Some(entry) = entry {
+                    self.push_to(&entry.handler, "shared-worker-abort", &[json!({ "id": key })]);
                     self.push_to(
-                        &requester,
+                        &entry.requester,
                         "shared-worker-resp",
-                        &[json!({ "id": message.get("id").cloned().unwrap_or(Value::Null), "error": "Aborted" })],
+                        &[json!({ "id": entry.request_id, "error": "Aborted" })],
                     );
                 }
                 Ok(undefined())
             }
             "shared-worker-update-params" => {
                 let Some(message) = args.first() else { return Ok(undefined()) };
-                let task_type = message.get("type").and_then(|value| value.as_str()).unwrap_or_default();
-                let handler = self.worker.lock().unwrap().handlers.get(task_type).cloned();
-                if let Some(handler) = handler {
-                    self.push_to(&handler, "shared-worker-update-params", &[message.clone()]);
+                let key = format!(
+                    "{window}:{}",
+                    message.get("id").map(id_string).unwrap_or_default()
+                );
+                let entry = self.worker.lock().unwrap().pending.get(&key).cloned();
+                if let Some(entry) = entry {
+                    let mut routed = message.clone();
+                    if let Some(object) = routed.as_object_mut() {
+                        object.insert("id".to_string(), Value::String(key));
+                    }
+                    self.push_to(&entry.handler, "shared-worker-update-params", &[routed]);
                 }
                 Ok(undefined())
             }
@@ -1245,7 +1579,7 @@ impl Bridge {
 
             // Window chrome / notifications: acknowledged, no native surface yet.
             "minimize" | "toggle-maximize" | "check-maximize" | "focus-window" | "main-window-expand"
-            | "set-login-size" | "close-window" | "hide-window" | "badge-count" | "renderer-ready"
+            | "set-login-size" | "close-window" | "hide-window" | "badge-count"
             | "app-started" | "get-auth-domain-ready" | "get-auth-domain" | "script-connected"
             | "script-terminated" | "open-channel-to" | "port-delivered" | "get-imei" => Ok(undefined()),
             other => {
@@ -1413,6 +1747,108 @@ pub fn value_bytes(value: &Value) -> Option<Vec<u8>> {
 
 fn arg_bytes(args: &[Value], index: usize) -> Option<Vec<u8>> {
     args.get(index).and_then(value_bytes)
+}
+
+/// The photo-thumbnail pipeline fails inside the renderer without saying why, so
+/// the members it depends on are logged as they arrive. Everything else on the
+/// bridge stays quiet — a photo bubble is not worth a line per call.
+fn trace_call(name: &str, args: &[Value]) {
+    const WATCH: [&str; 5] = [
+        "exec_raw",
+        "gen-thumb_write-savepath-file-photo",
+        "$zFileManager.svcReadPath",
+        "$zFileManager.svcStatAsync",
+        "$zFileManager.getFileArrayBuffer",
+    ];
+    let all = std::env::var("OLAZ_TRACE_ALL").map(|value| value == "1").unwrap_or(false);
+    if !all && !WATCH.contains(&name) {
+        return;
+    }
+    let first = args.first().map(Value::to_string).unwrap_or_default();
+    let brief: String = first.chars().take(240).collect();
+    eprintln!("[bridge] call {name} {brief}");
+}
+
+/// `$zFeatures.mainless.execRaw` tasks the photo-thumbnail pipeline needs.
+///
+/// `rmd5` keys the thumbnail cache (`thumb-file-v2` compares it with the checksum
+/// the message carries); `genThumbPicBuffer` decodes the message photo and hands
+/// back a JPEG that fits 600×600. Everything else stays unsupported so the
+/// renderer sees the same rejection macOS gives for tasks Linux has no worker for.
+fn exec_raw(task: &str, params: Value) -> Result<Value, String> {
+    let params: Vec<Value> = params.as_array().cloned().unwrap_or_default();
+    match task {
+        "rmd5" => {
+            let bytes = arg_bytes(&params, 0).ok_or_else(|| "EINVAL: rmd5 thiếu buffer".to_string())?;
+            Ok(Value::String(hex_encode(&md5::Md5::digest(&bytes))))
+        }
+        "genThumbPicBuffer" => {
+            let request = params.first().cloned().unwrap_or(Value::Null);
+            let options = request.get("options").cloned().unwrap_or(Value::Null);
+            let source = options
+                .get("buffer")
+                .and_then(value_bytes)
+                .or_else(|| {
+                    request
+                        .get("inputPath")
+                        .and_then(Value::as_str)
+                        .and_then(|path| std::fs::read(path).ok())
+                })
+                .ok_or_else(|| "EINVAL: genThumbPicBuffer thiếu buffer".to_string())?;
+            let picture = decode_picture(&source)?;
+            let (width, height) = (picture.width(), picture.height());
+            let mut jpeg = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 75)
+                .encode_image(&picture.thumbnail(600, 600))
+                .map_err(|error| format!("EIO: jpeg {error}"))?;
+            Ok(json!({
+                "buffer": bytes_out(jpeg, true),
+                "tDimension": { "width": width, "height": height },
+            }))
+        }
+        other => Err(format!("NotSupported: {other}")),
+    }
+}
+
+/// JPEG XL (what the CDN serves) or an image the `image` crate already knows.
+fn decode_picture(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    if crate::download::is_jxl(bytes) {
+        let decoder = jxl_oxide::integration::JxlDecoder::new(std::io::Cursor::new(bytes))
+            .map_err(|error| format!("EINVAL: jxl {error}"))?;
+        return image::DynamicImage::from_decoder(decoder)
+            .map_err(|error| format!("EINVAL: jxl {error}"));
+    }
+    image::load_from_memory(bytes).map_err(|error| format!("EINVAL: ảnh {error}"))
+}
+
+/// One path component made of characters a Zalo id can produce; anything else is
+/// dropped so a renderer-supplied value cannot walk out of the downloads folder.
+fn path_component(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect()
+}
+
+/// `<userData>/ZaloPC` — the root the official client keeps `ZaloDownloads` under.
+///
+/// Deriving it from `userdata.parent()` only works while userData is
+/// `<XDG_DATA_HOME>/olaz`; `OLAZ_USERDATA` (the test harness) and any distro that moves
+/// the profile put it elsewhere, and a cache written to the wrong tree is one the
+/// renderer never reads. Ask `host::userdata_dir()` instead, and fall back to the
+/// sibling layout for a userData that a previous version created that way.
+fn bridge_zalo_pc(userdata: &Path) -> PathBuf {
+    let sibling = userdata
+        .parent()
+        .map(|share| share.join("olaz").join("ZaloPC"))
+        .unwrap_or_else(|| userdata.join("ZaloPC"));
+    let resolved = crate::host::userdata_dir().join("ZaloPC");
+    // `OLAZ_USERDATA` is the explicit override — believe it over the derived sibling.
+    let explicit = std::env::var("OLAZ_USERDATA").map(|value| !value.is_empty()).unwrap_or(false);
+    if explicit || !sibling.is_dir() || resolved == sibling {
+        return resolved;
+    }
+    sibling
 }
 
 fn id_string(value: &Value) -> String {
@@ -1839,6 +2275,64 @@ mod tests {
         assert!(url.contains("client_version=695"));
         assert!(url.contains("app_version=26.11.10"));
         assert!(!url.contains("app_version=26.10.20"));
+    }
+
+    #[test]
+    fn shared_worker_routes_same_numeric_task_id_to_each_requester() {
+        let dir = std::env::temp_dir().join(format!("olaz-worker-routes-{}", std::process::id()));
+        let events = Arc::new(Events::new());
+        let bridge = Bridge::new(dir, "694".into(), false, events.clone());
+        events.push(json!({ "kind": "baseline" }));
+
+        bridge.channel("shared-worker-handle", &[json!("main-task")], false, "main").unwrap();
+        bridge
+            .channel("shared-worker-handle", &[json!("worker-task")], false, "shared-worker")
+            .unwrap();
+        bridge
+            .channel(
+                "shared-worker-run",
+                &[json!({ "id": 1, "type": "main-task" })],
+                false,
+                "main",
+            )
+            .unwrap();
+        bridge
+            .channel(
+                "shared-worker-run",
+                &[json!({ "id": 1, "type": "worker-task" })],
+                false,
+                "shared-worker",
+            )
+            .unwrap();
+
+        let (run_cursor, runs) = events.since(1, std::time::Duration::ZERO);
+        assert_eq!(runs.len(), 2);
+
+        bridge
+            .channel(
+                "shared-worker-resp",
+                &[json!({ "id": runs[0]["args"][0]["id"], "result": "main" })],
+                false,
+                "main",
+            )
+            .unwrap();
+        bridge
+            .channel(
+                "shared-worker-resp",
+                &[json!({ "id": runs[1]["args"][0]["id"], "result": "worker" })],
+                false,
+                "shared-worker",
+            )
+            .unwrap();
+
+        let (_, responses) = events.since(run_cursor, std::time::Duration::ZERO);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["target"], "main");
+        assert_eq!(responses[0]["args"][0]["id"], 1);
+        assert_eq!(responses[0]["args"][0]["result"], "main");
+        assert_eq!(responses[1]["target"], "shared-worker");
+        assert_eq!(responses[1]["args"][0]["id"], 1);
+        assert_eq!(responses[1]["args"][0]["result"], "worker");
     }
 
     #[test]

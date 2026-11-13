@@ -5,6 +5,7 @@
 
 mod asar;
 mod bridge;
+mod download;
 mod fingerprint;
 mod host;
 mod net;
@@ -113,6 +114,15 @@ fn main() {
                 .inner_size(1.0, 1.0)
                 .initialization_script(&script)
                 .build()?;
+            }
+            // Photos that predate the cache-stem fix get their `Cache/` variants here,
+            // off the UI thread. The walk is idempotent and skips complete entries.
+            let zalo_pc = host::userdata_dir().join("ZaloPC");
+            std::thread::spawn(move || crate::download::seed_existing_caches(&zalo_pc));
+            // Started after both windows exist; the watcher is on by default
+            // in debug builds and only touches <userData>/dev.
+            if ctx.dev_eval_enabled() {
+                host::start_dev_harness(ctx.clone());
             }
             Ok(())
         })

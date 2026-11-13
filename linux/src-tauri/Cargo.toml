@@ -34,6 +34,8 @@ aes-gcm = "0.10"
 rand = "0.8"
 libc = "0.2"
 percent-encoding = "2"
+jxl-oxide = { version = "0.12", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [profile.release]
 opt-level = "s"

@@ -21,7 +21,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -144,6 +144,11 @@ pub fn helper(ctx: &AppContext) -> Option<Arc<Helper>> {
             None
         }
     }
+}
+
+/// Returns the app-owned helper only; callers must not start or take ownership of it.
+pub fn running_helper() -> Option<Arc<Helper>> {
+    state().lock().unwrap().helper.clone()
 }
 
 /// Starts the helper early so the first request does not wait for it.
@@ -386,6 +391,14 @@ impl Helper {
     }
 
     pub fn perform(&self, request: &Request) -> Result<Response, Error> {
+        self.perform_cancelable(request, None)
+    }
+
+    pub fn perform_cancelable(
+        &self,
+        request: &Request,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Response, Error> {
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = mpsc::channel();
         self.shared.pending.lock().unwrap().insert(id, tx);
@@ -423,9 +436,18 @@ impl Helper {
         } else {
             Duration::from_secs(600)
         };
-        let reply = match rx.recv_timeout(wait) {
-            Ok(reply) => reply,
-            Err(_) => {
+        let deadline = Instant::now() + wait;
+        let reply = loop {
+            if cancel
+                .map(|flag| flag.load(Ordering::Relaxed))
+                .unwrap_or(false)
+            {
+                let _ = self.send_line(&format!("CANCEL {id}\n"));
+                self.shared.pending.lock().unwrap().remove(&id);
+                return Err(Error::Failed("canceled".to_string()));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 let _ = self.send_line(&format!("CANCEL {id}\n"));
                 self.shared.pending.lock().unwrap().remove(&id);
                 return Err(Error::Failed(if request.timeout_ms > 0 {
@@ -433,6 +455,19 @@ impl Helper {
                 } else {
                     "fingerprint helper không trả lời".to_string()
                 }));
+            }
+            let poll = if cancel.is_some() {
+                remaining.min(Duration::from_millis(100))
+            } else {
+                remaining
+            };
+            match rx.recv_timeout(poll) {
+                Ok(reply) => break reply,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.shared.pending.lock().unwrap().remove(&id);
+                    return Err(Error::Unavailable("fingerprint helper đã đóng kết nối".into()));
+                }
             }
         };
 

@@ -10,10 +10,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -29,14 +29,17 @@ pub struct AppContext {
     pub bridge: Bridge,
     pub events: Arc<Events>,
     pub debug: bool,
-    /// Debug-only JS evaluation in the main renderer (`OLAZ_DEV_EVAL=1`). Off
-    /// by default: the endpoint and the page handler both check this flag.
+    /// JS evaluation in the main renderer and the hidden shared worker.
+    /// On by default in debug builds; release builds require `OLAZ_DEV_EVAL=1`,
+    /// and `OLAZ_DEV_EVAL=0` turns it off in either build. The endpoints, the
+    /// file watcher and the page handler all check this flag.
     dev_eval: bool,
     dev_eval_seq: AtomicU64,
     dev_eval_waiters: Mutex<HashMap<u64, mpsc::Sender<String>>>,
     /// First-run installer state, shown on `/__olaz/index.html`.
     pub runtime: Arc<Mutex<RuntimeState>>,
     port: AtomicU16,
+    aux_port: AtomicU16,
     /// The whole injected bundle (shim + spec + host scripts), served as
     /// `/__olaz/boot.js` and referenced from every page this host serves.
     boot: Mutex<String>,
@@ -131,7 +134,10 @@ impl Default for Events {
 impl AppContext {
     pub fn load() -> Result<Self, String> {
         let debug = std::env::var("OLAZ_DEBUG").map(|v| v != "0").unwrap_or(false);
-        let dev_eval = std::env::var("OLAZ_DEV_EVAL").map(|v| v == "1").unwrap_or(false);
+        let dev_eval = match std::env::var("OLAZ_DEV_EVAL") {
+            Ok(value) => value == "1",
+            Err(_) => cfg!(debug_assertions),
+        };
         let userdata = userdata_dir();
         std::fs::create_dir_all(&userdata).map_err(|e| format!("không tạo được {}: {e}", userdata.display()))?;
         // A runtime downloaded by the previous launch is promoted before any
@@ -213,6 +219,7 @@ impl AppContext {
             dev_eval_waiters: Mutex::new(HashMap::new()),
             runtime: Arc::new(Mutex::new(runtime_state)),
             port: AtomicU16::new(0),
+            aux_port: AtomicU16::new(0),
             boot: Mutex::new(String::new()),
         })
     }
@@ -226,6 +233,45 @@ impl AppContext {
 
     pub fn port(&self) -> u16 {
         self.port.load(Ordering::Relaxed)
+    }
+
+    /// Secondary loopback port for the long-poll and media file routes (see
+    /// `start`), so they never contend with the page's own traffic for the
+    /// renderer's per-host connection budget.
+    pub fn set_aux_port(&self, port: u16) {
+        self.aux_port.store(port, Ordering::Relaxed);
+    }
+
+    pub fn aux_port(&self) -> u16 {
+        self.aux_port.load(Ordering::Relaxed)
+    }
+
+    pub fn dev_eval_enabled(&self) -> bool {
+        self.dev_eval
+    }
+
+    /// Runs `code` in the main renderer or the hidden shared worker and waits
+    /// for the page to post its JSON result back to `/__olaz/dev/eval-result`.
+    fn dev_eval(&self, target: &str, code: &str, timeout: Duration) -> Result<String, String> {
+        let id = self.dev_eval_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let (sender, receiver) = mpsc::channel();
+        self.dev_eval_waiters.lock().unwrap().insert(id, sender);
+        self.events.push(json!({
+            "kind": "dev-eval",
+            "id": id,
+            "code": code,
+            "target": target
+        }));
+        match receiver.recv_timeout(timeout) {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                self.dev_eval_waiters.lock().unwrap().remove(&id);
+                Err(format!(
+                    "renderer {target} không trả lời trong {} giây",
+                    timeout.as_secs()
+                ))
+            }
+        }
     }
 
     pub fn set_runtime(&self, state: RuntimeState) {
@@ -285,8 +331,308 @@ impl AppContext {
         let archive = guard.as_ref()?;
         let relative = path.trim_start_matches('/');
         let relative = if relative.is_empty() { "index.html".to_string() } else { relative.to_string() };
-        archive.read(&format!("pc-dist/{relative}"))
+        archive
+            .read(&format!("pc-dist/{relative}"))
+            .map(|body| patch_sync_asset(&relative, body))
     }
+}
+
+/// The macOS host finishes the DAL worker's setup before its own bundle runs.
+/// `sync-v2-sub-worker` writes imported messages through the "lite IDB" path,
+/// whose encryption-state store needs the DB client created by
+/// `database-manager.createQueryBuilder`; nothing in a web worker creates that
+/// client (Application lifecycle is unsupported there). Linux served the
+/// original JS, so sync failed before writing a message.
+const SYNC_WORKER_PRELUDE: &str = r#"
+(() => {
+  const fwd = (k, v) => { try { self.postMessage({ __zhostLog: k + ' ' + String(v).slice(0, 300) }); } catch {} };
+  self.__zhostFwd = fwd;
+  fwd('prelude-loaded', self.name || '');
+  const errText = (e) => e ? (e.name || '') + ': ' + (e.message || e) : String(e);
+  self.addEventListener('error', (e) => fwd('error', e.message));
+  self.addEventListener('unhandledrejection', (e) => fwd('unhandledrejection', errText(e.reason)));
+  for (const lvl of ['warn', 'error']) {
+    const o = console[lvl];
+    console[lvl] = (...a) => { fwd('console.' + lvl, a.map((x) => x instanceof Error ? errText(x) : (typeof x === 'string' ? x : '')).join(' ')); return o.apply(console, a); };
+  }
+  const ensureDatabaseClient = () => {
+    try {
+      const req = self.__swReq;
+      if (!req || !req.c) { fwd('webpack require not exposed', ''); return; }
+      for (const id of Object.keys(req.c)) {
+        try {
+          const d = req.c[id] && req.c[id].exports && req.c[id].exports.default;
+          if (d && typeof d.getInstance === 'function' && String(d.getInstance).includes('createQueryBuilder')) {
+            d.getInstance(); fwd('database client ready', id); return;
+          }
+        } catch (e) {}
+      }
+      fwd('database client accessor not found', '');
+    } catch (e) { fwd('database client setup failed', errText(e)); }
+  };
+  if (typeof self.importScripts === 'function') {
+    const imp = self.importScripts;
+    self.importScripts = function (...urls) {
+      const r = imp.apply(this, urls);
+      if (urls.some((u) => /sync-v2-sub-worker/.test(String(u)))) { fwd('sync-v2 imported', ''); ensureDatabaseClient(); }
+      return r;
+    };
+  }
+  if (typeof IDBDatabase !== 'undefined') {
+    const tx = IDBDatabase.prototype.transaction;
+    IDBDatabase.prototype.transaction = function (...a) {
+      const t = tx.apply(this, a);
+      t.addEventListener('abort', () => fwd('idb-abort', errText(t.error)));
+      return t;
+    };
+    for (const m of ['add', 'put']) {
+      const o = IDBObjectStore.prototype[m];
+      IDBObjectStore.prototype[m] = function (...a) {
+        try {
+          const r = o.apply(this, a);
+          r.addEventListener('error', () => fwd('idb-' + m + '-error', this.name + ' ' + errText(r.error)));
+          return r;
+        } catch (e) { fwd('idb-' + m + '-throw', this.name + ' ' + errText(e)); throw e; }
+      };
+    }
+    const open = IDBFactory.prototype.open;
+    IDBFactory.prototype.open = function (...a) {
+      const r = open.apply(this, a);
+      r.addEventListener('error', () => fwd('idb-open-error', errText(r.error)));
+      r.addEventListener('blocked', () => fwd('idb-open-blocked', ''));
+      return r;
+    };
+  }
+})();
+"#;
+
+/// The sub-worker runs in its own scope, where the DAL prelude never runs, so
+/// `self.__zhostFwd` was undefined and the instrumentation above stayed silent.
+/// Give it a forwarder that reaches the host over loopback (the HTTP route logs it).
+const SUB_WORKER_PRELUDE: &str = r#"
+(() => {
+  self.__zhostFwd = (k, v) => { try { fetch('/__olaz/log?m=' + encodeURIComponent(k + ' ' + String(v).slice(0, 300)), { cache: 'no-store' }).catch(() => {}); } catch (e) {} };
+})();
+"#;
+
+fn patch_sync_asset(path: &str, data: Vec<u8>) -> Vec<u8> {
+    let is_js = path.ends_with(".js");
+    let data = if path.starts_with("dal-worker.") && is_js {
+        let mut out = Vec::with_capacity(SYNC_WORKER_PRELUDE.len() + data.len() + 2);
+        out.extend_from_slice(SYNC_WORKER_PRELUDE.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(&data);
+        out
+    } else if path.starts_with("sync-v2-sub-worker.") && is_js {
+        let data = expose_webpack_require(data);
+        #[cfg(debug_assertions)]
+        let data = {
+            let mut out = Vec::with_capacity(SUB_WORKER_PRELUDE.len() + data.len() + 1);
+            out.extend_from_slice(SUB_WORKER_PRELUDE.as_bytes());
+            out.extend_from_slice(&data);
+            patch_sync_insert_success(patch_sync_insert_error(out))
+        };
+        data
+    } else if path.starts_with("lazy/main-startup.") && is_js {
+        patch_sync_global_id_resolver(data)
+    } else {
+        data
+    };
+    if is_js { patch_worker_pool_timeout(data) } else { data }
+}
+
+/// The sync-v2 worker pool settles a task as `TIMEOUT` after 10 s
+/// (`` `Task ${id} timed out after 10000 ms` ``) and drops it, which surfaces as
+/// `insertToDb` failing and the transfer ending in `MSG_IMPORT_FAILED` (1037).
+/// That budget is tuned for Zalo's SQLite path; on Linux every write goes through
+/// WebKitGTK's IndexedDB, which is far slower for the 2000-message import batches,
+/// so batches that are still writing get killed. Give the pool a budget that fits
+/// the storage path — the task itself is unchanged, only how long it may take.
+fn patch_worker_pool_timeout(data: Vec<u8>) -> Vec<u8> {
+    const NEEDLE: &[u8] = b"this.taskTimeout=i,this.workers=[]";
+    const REPLACEMENT: &[u8] = b"this.taskTimeout=Math.max(i,1.2e5),this.workers=[]";
+    let Some(pos) = find_bytes(&data, NEEDLE) else { return data };
+    if find_bytes(&data[pos + NEEDLE.len()..], NEEDLE).is_some() {
+        return data;
+    }
+    let mut out = Vec::with_capacity(data.len() + REPLACEMENT.len() - NEEDLE.len());
+    out.extend_from_slice(&data[..pos]);
+    out.extend_from_slice(REPLACEMENT);
+    out.extend_from_slice(&data[pos + NEEDLE.len()..]);
+    out
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+/// Debug builds: the official logger swallows `insertToDb` failures. Forward
+/// the caught error to the DAL worker prelude so a stalled sync says why.
+fn patch_sync_insert_error(data: Vec<u8>) -> Vec<u8> {
+    const NEEDLE: &[u8] = b"throw this.logger.zsymb(18,\"cEXelp\",\"Error when insert messages to db\",n)";
+    let Some(pos) = find_bytes(&data, NEEDLE) else { return data };
+    if find_bytes(&data[pos + NEEDLE.len()..], NEEDLE).is_some() {
+        return data;
+    }
+    const REPORT: &[u8] = br#"self.__zhostFwd&&self.__zhostFwd('insertToDb-failed',n&&((n.name||'')+': '+(n.message||n)+' | '+String(n.stack||'').split('\n').slice(0,6).join(' < ')));"#;
+    let mut out = Vec::with_capacity(data.len() + REPORT.len());
+    out.extend_from_slice(&data[..pos]);
+    out.extend_from_slice(REPORT);
+    out.extend_from_slice(&data[pos..]);
+    out
+}
+
+/// Debug builds: the importer reports a finished batch only through the official logger, which
+/// this host never sees, so a sync run cannot tell written rows from dropped ones. Forward the
+/// counts of the batch that `insertMessage` just returned.
+fn patch_sync_insert_success(data: Vec<u8>) -> Vec<u8> {
+    // Inserted after a complete statement: splicing between call arguments produced a
+    // stray comma and the whole sub-worker failed to parse (`Unexpected identifier 'self'`).
+    const NEEDLE: &[u8] = b"const a=await this.insertMessage(e);";
+    const REPORT: &[u8] = br#"self.__zhostFwd&&self.__zhostFwd('insert-msgs','ok='+a.success.length+' fail='+a.fail.length);"#;
+    let Some(pos) = find_bytes(&data, NEEDLE) else { return data };
+    if find_bytes(&data[pos + NEEDLE.len()..], NEEDLE).is_some() {
+        return data;
+    }
+    let at = pos + NEEDLE.len();
+    let mut out = Vec::with_capacity(data.len() + REPORT.len());
+    out.extend_from_slice(&data[..at]);
+    out.extend_from_slice(REPORT);
+    out.extend_from_slice(&data[at..]);
+    out
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+}
+
+fn valid_ident(text: &str) -> bool {
+    !text.is_empty() && !text.as_bytes()[0].is_ascii_digit() && text.bytes().all(is_ident_byte)
+}
+
+fn ident_start(text: &str, end: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut start = end;
+    while start > 0 && is_ident_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    start
+}
+
+/// Exposes the sync-v2 sub-worker's private webpack `require` as
+/// `self.__swReq`, so `SYNC_WORKER_PRELUDE` can finish the DB-client setup.
+/// Only patches one unambiguous runtime; otherwise serves the original bytes.
+fn expose_webpack_require(data: Vec<u8>) -> Vec<u8> {
+    const TAIL: &[u8] = b"=function(e){var t=[],n=a[e]";
+    let Some(pos) = find_bytes(&data, TAIL) else {
+        eprintln!("[olaz] sync-v2-sub-worker served unpatched: runtime shape not found");
+        return data;
+    };
+    if find_bytes(&data[pos + TAIL.len()..], TAIL).is_some() {
+        eprintln!("[olaz] sync-v2-sub-worker served unpatched: runtime shape ambiguous");
+        return data;
+    }
+    if pos < 2 || &data[pos - 2..pos] != b".e" {
+        eprintln!("[olaz] sync-v2-sub-worker served unpatched: no .e accessor");
+        return data;
+    }
+    let mut start = pos - 2;
+    while start > 0 && is_ident_byte(data[start - 1]) {
+        start -= 1;
+    }
+    if start == pos - 2 || start == 0 || data[start].is_ascii_digit() || !matches!(data[start - 1], b'}' | b';') {
+        eprintln!("[olaz] sync-v2-sub-worker served unpatched: not at a statement boundary");
+        return data;
+    }
+    let mut out = Vec::with_capacity(data.len() + (pos - start) + 20);
+    out.extend_from_slice(&data[..start]);
+    out.extend_from_slice(b"self.__swReq=");
+    out.extend_from_slice(&data[start..pos - 2]);
+    out.push(b';');
+    out.extend_from_slice(&data[start..]);
+    out
+}
+
+/// The macOS `patchSyncGlobalIdResolver`: ask the official global-id service
+/// for the 1-1 ids the profile lookup left unmapped. Without it, a resumed
+/// sync can abort with EXCEEDED_MAX_BATCH_FAIL.
+fn patch_sync_global_id_resolver(data: Vec<u8>) -> Vec<u8> {
+    let Ok(source) = String::from_utf8(data.clone()) else { return data };
+    const MARKER: &str = "getGlobalIdsFromUserIds";
+    let mut patched: Option<(usize, usize, String)> = None;
+    for (marker, _) in source.match_indices(MARKER) {
+        let Some(found) = parse_sync_resolver(&source, marker) else { continue };
+        if patched.is_some() {
+            eprintln!("[olaz] main-startup served unpatched: resolver shape ambiguous");
+            return data;
+        }
+        patched = Some(found);
+    }
+    let Some((start, end, replacement)) = patched else {
+        eprintln!("[olaz] main-startup served unpatched: resolver shape not found");
+        return data;
+    };
+    let mut out = source;
+    out.replace_range(start..end, &replacement);
+    out.into_bytes()
+}
+
+/// Parses `svc.resolveWithRetry(ids,(arg=>mgr.default.getGlobalIdsFromUserIds(arg)))`
+/// around `marker`, where `marker` is the start of `getGlobalIdsFromUserIds`.
+fn parse_sync_resolver(source: &str, marker: usize) -> Option<(usize, usize, String)> {
+    const DEFAULT: &str = ".default.";
+    if !source[..marker].ends_with(DEFAULT) {
+        return None;
+    }
+    let mgr_end = marker - DEFAULT.len();
+    let mgr_start = ident_start(source, mgr_end);
+    let mgr = &source[mgr_start..mgr_end];
+    if !valid_ident(mgr) || !source[..mgr_start].ends_with("=>") {
+        return None;
+    }
+    let arg_end = mgr_start - 2;
+    let arg_start = ident_start(source, arg_end);
+    let arg = &source[arg_start..arg_end];
+    if !valid_ident(arg) || !source[..arg_start].ends_with('(') {
+        return None;
+    }
+    let arrow_open = arg_start - 1;
+    if !source[..arrow_open].ends_with(',') {
+        return None;
+    }
+    let ids_end = arrow_open - 1;
+    let ids_start = ident_start(source, ids_end);
+    let ids = &source[ids_start..ids_end];
+    if !valid_ident(ids) {
+        return None;
+    }
+    const CALL: &str = ".resolveWithRetry(";
+    let call = source[..ids_start].rfind(CALL)?;
+    let svc_start = ident_start(source, call);
+    let svc = &source[svc_start..call];
+    if !valid_ident(svc) || call + CALL.len() != ids_start {
+        return None;
+    }
+    let expected = format!("({arg})))");
+    let tail = marker + "getGlobalIdsFromUserIds".len();
+    if !source[tail..].starts_with(&expected) {
+        return None;
+    }
+    let end = tail + expected.len();
+    let mut replacement = String::new();
+    replacement.push_str(svc);
+    replacement.push_str(".resolveWithRetry(");
+    replacement.push_str(ids);
+    replacement.push_str(",(async ");
+    replacement.push_str(arg);
+    replacement.push_str("=>{let __r=await ");
+    replacement.push_str(mgr);
+    replacement.push_str(".default.getGlobalIdsFromUserIds(");
+    replacement.push_str(arg);
+    replacement.push_str(")||{};const __m=");
+    replacement.push_str(ids);
+    replacement.push_str(".filter(__i=>!__r[__i]),__f=window.__swzGlobalIdFallback;if(__m.length&&typeof __f===\"function\")try{__r=Object.assign({},__r,await __f(__m))}catch(__e){}return __r}))");
+    Some((svc_start, end, replacement))
 }
 
 /// First-run initialisation, run once the bridge is up: check what is installed
@@ -379,6 +725,10 @@ pub struct Running {
 /// `fail_sqlite3=true`) always looked empty — no cached conversations, and the
 /// sync started from zero each time. One fixed port keeps that data.
 const DEFAULT_PORT: u16 = 27_182;
+const DEV_EVAL_MAX_CODE: usize = 64 * 1024;
+const DEV_EVAL_TIMEOUT: Duration = Duration::from_secs(20);
+const DEV_COMPOSE_TIMEOUT: Duration = Duration::from_secs(90);
+const DEV_COMPOSE_MAX_JOB: u64 = 1024 * 1024;
 
 pub fn start(ctx: Arc<AppContext>) -> std::io::Result<Running> {
     let preferred = std::env::var("OLAZ_PORT")
@@ -399,6 +749,19 @@ pub fn start(ctx: Arc<AppContext>) -> std::io::Result<Running> {
         ))
     })?;
     let server = Arc::new(server);
+    // Bind the aux server before `set_port` bakes the boot script: the script
+    // carries both ports (see the comment below on why the aux port exists).
+    let mut aux = None;
+    for candidate in (port + 1)..=(port + 16) {
+        match Server::http(("127.0.0.1", candidate)) {
+            Ok(server) => {
+                aux = Some(Arc::new(server));
+                ctx.set_aux_port(candidate);
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
     ctx.set_port(port);
     for _ in 0..12 {
         let server = server.clone();
@@ -409,7 +772,177 @@ pub fn start(ctx: Arc<AppContext>) -> std::io::Result<Running> {
             }
         });
     }
+    // A second loopback server for the routes that hold or stream a connection
+    // for a long time: the long-poll (up to 20 s) and `/__olaz/file` (whole
+    // media files). WebKitGTK budgets ~6 connections per host for a page, and
+    // two webviews keep two long-polls pinned permanently — photo requests to
+    // the main port then queue behind them and the bubble's `<img>` sits in
+    // `complete === false` forever even though the file is on disk. The aux
+    // port has its own connection budget, so images and polls never compete
+    // with the page's bridge traffic. Any port next to the fixed main port
+    // works: nothing keys storage or origin off it.
+    if let Some(aux_server) = aux {
+        for _ in 0..8 {
+            let aux_server = aux_server.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                for request in aux_server.incoming_requests() {
+                    handle(&ctx, request);
+                }
+            });
+        }
+    }
     Ok(Running { port })
+}
+
+/// The macOS dev channel watches files in `<userData>/dev` while
+/// `OlazDevEval` is on. Linux had only the HTTP endpoint, so long-lived
+/// experiments had to paste code into curl each time. This runs the same file
+/// tools against the two renderer windows:
+///
+///   eval.js          -> eval.out.json          (main renderer)
+///   worker-eval.js   -> worker-eval.out.json   (hidden shared worker)
+///   open-conv.txt    -> opens that conversation once
+///   compose.json     -> compose.out.txt        (composer action, optional files)
+///
+/// Started by default in debug builds (`OLAZ_DEV_EVAL=0` disables it, release
+/// builds need `OLAZ_DEV_EVAL=1`); a production launch therefore has no file
+/// watcher and no way to read these files.
+pub fn start_dev_harness(ctx: Arc<AppContext>) {
+    if !ctx.dev_eval {
+        return;
+    }
+    let dir = ctx.userdata.join("dev");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("[olaz] dev harness: không tạo được {} — {error}", dir.display());
+        return;
+    }
+    eprintln!("[olaz] dev harness: {} (eval.js, worker-eval.js, open-conv.txt, compose.json)", dir.display());
+    std::thread::spawn(move || {
+        let mut eval_mtime = None;
+        let mut worker_mtime = None;
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            open_dev_conversation(&ctx, &dir);
+            run_dev_compose(&ctx, &dir);
+            watch_dev_eval(&ctx, &dir, "eval.js", "main", "eval.out.json", &mut eval_mtime);
+            watch_dev_eval(&ctx, &dir, "worker-eval.js", "shared-worker", "worker-eval.out.json", &mut worker_mtime);
+        }
+    });
+}
+
+fn watch_dev_eval(
+    ctx: &Arc<AppContext>,
+    dir: &std::path::Path,
+    input: &str,
+    target: &str,
+    output: &str,
+    seen: &mut Option<SystemTime>,
+) {
+    let path = dir.join(input);
+    let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified()) else {
+        return;
+    };
+    if seen.is_some_and(|last| modified <= last) {
+        return;
+    }
+    *seen = Some(modified);
+    let source = match std::fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) => {
+            write_dev_output(dir, output, &dev_error(format!("không đọc được {input}: {error}")));
+            return;
+        }
+    };
+    if source.len() > DEV_EVAL_MAX_CODE {
+        write_dev_output(
+            dir,
+            output,
+            &dev_error(format!("{input} quá {} KB", DEV_EVAL_MAX_CODE / 1024)),
+        );
+        return;
+    }
+    let result = ctx
+        .dev_eval(target, &source, DEV_EVAL_TIMEOUT)
+        .unwrap_or_else(dev_error);
+    write_dev_output(dir, output, &result);
+}
+
+fn open_dev_conversation(ctx: &Arc<AppContext>, dir: &std::path::Path) {
+    let path = dir.join("open-conv.txt");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
+    let id = text.trim();
+    if id.is_empty() {
+        return;
+    }
+    let id = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string());
+    let code = format!(
+        "const c = window.__zaloChat; if (!c || typeof c.open !== 'function') throw new Error('chat adapter chưa sẵn sàng'); return await c.open({id});"
+    );
+    if let Err(error) = ctx.dev_eval("main", &code, DEV_EVAL_TIMEOUT) {
+        eprintln!("[olaz] dev open-conv: {error}");
+    }
+}
+
+fn run_dev_compose(ctx: &Arc<AppContext>, dir: &std::path::Path) {
+    let path = dir.join("compose.json");
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return;
+    };
+    if meta.len() > DEV_COMPOSE_MAX_JOB {
+        let _ = std::fs::remove_file(&path);
+        write_dev_output(dir, "compose.out.txt", &dev_error("compose.json quá 1 MB".to_string()));
+        return;
+    }
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
+    let job: Value = match serde_json::from_str(&data) {
+        Ok(job) => job,
+        Err(error) => {
+            write_dev_output(dir, "compose.out.txt", &dev_error(format!("compose.json không hợp lệ: {error}")));
+            return;
+        }
+    };
+    let method = job.get("method").and_then(Value::as_str).unwrap_or("");
+    if method.is_empty() {
+        write_dev_output(dir, "compose.out.txt", &dev_error("compose.json thiếu method".to_string()));
+        return;
+    }
+    let args = job.get("args").cloned().unwrap_or_else(|| json!([]));
+    if !args.is_array() {
+        write_dev_output(dir, "compose.out.txt", &dev_error("compose.json: args phải là mảng".to_string()));
+        return;
+    }
+    let files: Vec<String> = job
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|rows| rows.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    let method = serde_json::to_string(method).unwrap_or_else(|_| "\"\"".to_string());
+    let args = serde_json::to_string(&args).unwrap_or_else(|_| "[]".to_string());
+    let files = serde_json::to_string(&files).unwrap_or_else(|_| "[]".to_string());
+    let code = format!(
+        "const d = window.__olazLinux; if (!d || typeof d.devCompose !== 'function') throw new Error('dev harness chưa nạp'); return await d.devCompose({method}, {args}, {files});"
+    );
+    let result = ctx
+        .dev_eval("main", &code, DEV_COMPOSE_TIMEOUT)
+        .unwrap_or_else(dev_error);
+    write_dev_output(dir, "compose.out.txt", &result);
+}
+
+fn write_dev_output(dir: &std::path::Path, name: &str, text: &str) {
+    if let Err(error) = std::fs::write(dir.join(name), text) {
+        eprintln!("[olaz] dev harness: không ghi được {name} — {error}");
+    }
+}
+
+fn dev_error(message: String) -> String {
+    json!({ "ok": false, "error": message }).to_string()
 }
 
 fn handle(ctx: &Arc<AppContext>, mut request: Request) {
@@ -421,6 +954,13 @@ fn handle(ctx: &Arc<AppContext>, mut request: Request) {
 
     if ctx.debug {
         eprintln!("[http] {} {path}", request.method());
+    }
+
+    // CORS preflight from the aux server's cross-origin callers (the page's
+    // long-poll and media reads live on the aux port — see `start`).
+    if *request.method() == Method::Options {
+        reply_preflight(request);
+        return;
     }
 
     // The main renderer and the hidden shared-worker page share this bridge;
@@ -495,36 +1035,56 @@ fn handle(ctx: &Arc<AppContext>, mut request: Request) {
                     return;
                 }
             };
+            let target = match dev_target(payload.get("target").and_then(Value::as_str)) {
+                Ok(target) => target,
+                Err(error) => {
+                    reply(request, 400, "application/json", json!({ "error": error }).to_string());
+                    return;
+                }
+            };
             let code = payload.get("code").and_then(Value::as_str).unwrap_or("");
-            if code.is_empty() || code.len() > 64 * 1024 {
-                reply(request, 400, "application/json", json!({ "error": "code rỗng hoặc quá 64 KB" }).to_string());
+            if code.is_empty() || code.len() > DEV_EVAL_MAX_CODE {
+                reply(
+                    request,
+                    400,
+                    "application/json",
+                    json!({ "error": format!("code rỗng hoặc quá {} KB", DEV_EVAL_MAX_CODE / 1024) }).to_string(),
+                );
                 return;
             }
-            let id = ctx.dev_eval_seq.fetch_add(1, Ordering::Relaxed) + 1;
-            let (sender, receiver) = mpsc::channel();
-            ctx.dev_eval_waiters.lock().unwrap().insert(id, sender);
-            ctx.events.push(json!({
-                "kind": "dev-eval",
-                "id": id,
-                "code": code,
-                "target": "main"
-            }));
-            match receiver.recv_timeout(Duration::from_secs(20)) {
+            match ctx.dev_eval(target, code, DEV_EVAL_TIMEOUT) {
                 Ok(result) => reply(
                     request,
                     200,
                     "application/json",
-                    json!({ "ok": true, "result": result }).to_string(),
+                    json!({ "ok": true, "target": target, "result": result }).to_string(),
                 ),
-                Err(_) => {
-                    ctx.dev_eval_waiters.lock().unwrap().remove(&id);
-                    reply(
-                        request,
-                        504,
-                        "application/json",
-                        json!({ "ok": false, "error": "renderer không trả lời trong 20 giây" }).to_string(),
-                    )
-                }
+                Err(error) => reply(
+                    request,
+                    504,
+                    "application/json",
+                    json!({ "ok": false, "error": error }).to_string(),
+                ),
+            }
+        }
+        (Method::Get, "/__olaz/dev/probe") | (Method::Post, "/__olaz/dev/probe") => {
+            if !ctx.dev_eval {
+                reply(request, 403, "application/json", json!({ "error": "OLAZ_DEV_EVAL chưa bật" }).to_string());
+                return;
+            }
+            match ctx.dev_eval("main", DEV_PROBE_SCRIPT, DEV_EVAL_TIMEOUT) {
+                Ok(result) => reply(
+                    request,
+                    200,
+                    "application/json",
+                    json!({ "ok": true, "target": "main", "result": result }).to_string(),
+                ),
+                Err(error) => reply(
+                    request,
+                    504,
+                    "application/json",
+                    json!({ "ok": false, "error": error }).to_string(),
+                ),
             }
         }
         (Method::Post, "/__olaz/dev/eval-result") => {
@@ -545,6 +1105,37 @@ fn handle(ctx: &Arc<AppContext>, mut request: Request) {
                 let _ = sender.send(result.to_string());
             }
             reply(request, 200, "application/json", json!({ "ok": true }).to_string());
+        }
+        // Local media for the renderer. The page is served over loopback, so WebKit
+        // refuses a `file://` subresource from it (verified: a `file://` image errors,
+        // while the same bytes through this route decode). Zalo's image component
+        // addresses the copies the download manager just saved as `file://`, and
+        // `web/olaz-linux.js` rewrites those to this route.
+        // Debug builds: the sync sub-worker forwards its own diagnostics here,
+        // because it cannot reach the DAL worker prelude's postMessage channel.
+        (Method::Get, p) if p.starts_with("/__olaz/log") => {
+            if !ctx.dev_eval {
+                reply(request, 403, "text/plain; charset=utf-8", "OLAZ_DEV_EVAL chưa bật".to_string());
+                return;
+            }
+            let message = param(&query, "m")
+                .map(|v| percent_encoding::percent_decode_str(&v).decode_utf8_lossy().into_owned())
+                .unwrap_or_default();
+            if !message.is_empty() {
+                eprintln!("[zhost] {message}");
+            }
+            reply(request, 200, "text/plain; charset=utf-8", "ok".to_string());
+        }
+        (Method::Get, p) if p.starts_with("/__olaz/file") => {
+            let Some(raw) = param(&query, "path") else {
+                reply(request, 400, "text/plain; charset=utf-8", "thiếu path".to_string());
+                return;
+            };
+            let path = percent_encoding::percent_decode_str(&raw).decode_utf8_lossy().into_owned();
+            match serve_local_file(ctx, &path) {
+                Some(local) => reply_local_file(request, local),
+                None => reply(request, 404, "text/plain; charset=utf-8", "not found".to_string()),
+            }
         }
         (Method::Get, p) if p.starts_with("/app/") || p == "/app" => {
             let relative = p.trim_start_matches("/app").trim_start_matches('/');
@@ -640,6 +1231,16 @@ fn truncate(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect::<String>() + "…"
 }
 
+fn dev_target(value: Option<&str>) -> Result<&'static str, String> {
+    match value.unwrap_or("main") {
+        "main" => Ok("main"),
+        // The page shim names its second window `shared-worker`; the HTTP API
+        // accepts the shorter `worker` spelling and normalises it to that.
+        "worker" | "shared-worker" => Ok("shared-worker"),
+        other => Err(format!("target không hợp lệ: {other} (dùng main hoặc worker)")),
+    }
+}
+
 fn param(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=')?;
@@ -654,9 +1255,22 @@ fn reply(request: Request, status: u16, content_type: &str, body: String) {
 fn reply_bytes(request: Request, status: u16, content_type: &str, body: Vec<u8>) {
     let content = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap();
     // The renderer and its bridge share one loopback origin, so this is only a
-    // guard for the sync XHR path if the origin ever differs.
+    // guard for the sync XHR path if the origin ever differs — and the CORS the
+    // aux server's cross-origin calls need (see `start`).
     let cors = Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
     let response = Response::from_data(body).with_status_code(status).with_header(content).with_header(cors);
+    let _ = request.respond(response);
+}
+
+/// Answers a CORS preflight for the aux server: the page polls and reads media
+/// from a second loopback port, so every non-simple request starts with one.
+fn reply_preflight(request: Request) {
+    let cors = |name: &[u8], value: &[u8]| Header::from_bytes(name, value).unwrap();
+    let response = Response::empty(204)
+        .with_header(cors(&b"Access-Control-Allow-Origin"[..], &b"*"[..]))
+        .with_header(cors(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS"[..]))
+        .with_header(cors(&b"Access-Control-Allow-Headers"[..], &b"*"[..]))
+        .with_header(cors(&b"Access-Control-Max-Age"[..], &b"86400"[..]));
     let _ = request.respond(response);
 }
 
@@ -719,6 +1333,10 @@ fn content_type(path: &str) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
         "gif" => "image/gif",
+        "jxl" => "image/jxl",
+        "bmp" => "image/bmp",
+        "heic" => "image/heic",
+        "mov" => "video/quicktime",
         "woff" => "font/woff",
         "woff2" => "font/woff2",
         "ttf" => "font/ttf",
@@ -729,6 +1347,213 @@ fn content_type(path: &str) -> &'static str {
         "pdf" => "application/pdf",
         _ => "application/octet-stream",
     }
+}
+
+/// A file the page may display: only inside the profile (the official client's
+/// `ZaloPC` / `ZaloDownloads`) or the user's own media folders — a loopback URL
+/// must never read an arbitrary path.
+fn serve_local_file(ctx: &AppContext, path: &str) -> Option<LocalFile> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let target = std::fs::canonicalize(path).ok()?;
+    if !target.is_file() {
+        return None;
+    }
+    let home = home_dir();
+    let mut roots = vec![ctx.userdata.clone()];
+    for (key, fallback) in [
+        ("XDG_DOWNLOAD_DIR", "Downloads"),
+        ("XDG_PICTURES_DIR", "Pictures"),
+        ("XDG_DOCUMENTS_DIR", "Documents"),
+        ("XDG_VIDEOS_DIR", "Videos"),
+        ("XDG_MUSIC_DIR", "Music"),
+    ] {
+        let root = std::env::var(key).map(PathBuf::from).unwrap_or_else(|_| home.join(fallback));
+        roots.push(root);
+    }
+    let allowed = roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .any(|root| target.starts_with(root));
+    if !allowed {
+        return None;
+    }
+    let length = std::fs::metadata(&target).ok()?.len();
+    let mime = media_type(&target)?;
+    Some(LocalFile {
+        path: target,
+        mime,
+        length,
+    })
+}
+
+struct LocalFile {
+    path: PathBuf,
+    mime: &'static str,
+    length: u64,
+}
+
+/// Answers `/__olaz/file` with `Range` support.
+///
+/// WebKitGTK's media element asks for byte ranges before it plays anything: a server
+/// that only ever answers `200` + the whole body makes a video bubble show its
+/// thumbnail and then refuse to play, and seeking is impossible. Images do not care,
+/// so both shapes go through here.
+fn reply_local_file(request: Request, local: LocalFile) {
+    let range = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Range"))
+        .map(|header| header.value.as_str().to_string());
+    let headers = |mut response: Response<_>| {
+        response.add_header(accept_ranges());
+        response
+    };
+    match range.as_deref().and_then(|value| parse_range(value, local.length)) {
+        // Unsatisfiable: the spec wants `416` plus the size so the client can retry.
+        Some(None) => {
+            let content_range =
+                Header::from_bytes(&b"Content-Range"[..], format!("bytes */{}", local.length).as_bytes()).unwrap();
+            let response = Response::empty(416).with_header(content_range).with_header(accept_ranges());
+            let _ = request.respond(response);
+        }
+        Some(Some((start, end))) => {
+            let body = match read_range(&local.path, start, end) {
+                Some(body) => body,
+                None => {
+                    let _ = request.respond(Response::empty(500));
+                    return;
+                }
+            };
+            let content_range = Header::from_bytes(
+                &b"Content-Range"[..],
+                format!("bytes {start}-{end}/{}", local.length).as_bytes(),
+            )
+            .unwrap();
+            let _ = request.respond(headers(
+                Response::from_data(body)
+                    .with_status_code(206)
+                    .with_header(content_header(local.mime))
+                    .with_header(content_range)
+                    .with_header(cors_header()),
+            ));
+        }
+        None => match std::fs::read(&local.path) {
+            Ok(body) => {
+                let _ = request.respond(headers(
+                    Response::from_data(body)
+                        .with_header(content_header(local.mime))
+                        .with_header(cors_header()),
+                ));
+            }
+            Err(_) => {
+                let _ = request.respond(Response::empty(500));
+            }
+        },
+    }
+}
+
+fn read_range(path: &Path, start: u64, end: u64) -> Option<Vec<u8>> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let length = (end - start + 1) as usize;
+    let mut body = vec![0u8; length];
+    file.read_exact(&mut body).ok()?;
+    Some(body)
+}
+
+/// One `Range` header, in the three shapes a media element sends.
+///
+/// `Ok(None)` for a malformed or multi-range request (answer `200`, the whole body),
+/// `Ok(Some(None))` for a range past the end (answer `416`), and
+/// `Ok(Some(Some((start, end))))` for the bytes to send — both ends inclusive.
+fn parse_range(value: &str, length: u64) -> Option<Option<(u64, u64)>> {
+    let spec = value.trim().strip_prefix("bytes=")?;
+    // Multi-range answers need a multipart body; a full response is always valid.
+    if spec.contains(',') {
+        return None;
+    }
+    let (from, to) = spec.split_once('-')?;
+    let (from, to) = (from.trim(), to.trim());
+    let (start, end) = if from.is_empty() {
+        // `bytes=-500`: the last 500 bytes.
+        let suffix: u64 = to.parse().ok()?;
+        if suffix == 0 || length == 0 {
+            return Some(None);
+        }
+        (length.saturating_sub(suffix), length - 1)
+    } else {
+        let start: u64 = from.parse().ok()?;
+        let end = if to.is_empty() { length.saturating_sub(1) } else { to.parse().ok()? };
+        (start, end.min(length.saturating_sub(1)))
+    };
+    if start > end || start >= length {
+        return Some(None);
+    }
+    Some(Some((start, end)))
+}
+
+fn accept_ranges() -> Header {
+    Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap()
+}
+
+fn content_header(mime: &'static str) -> Header {
+    Header::from_bytes(&b"Content-Type"[..], mime.as_bytes()).unwrap()
+}
+
+fn cors_header() -> Header {
+    Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap()
+}
+
+/// Downloaded media often has no extension (the official client names files by
+/// id), and a cached variant can carry the extension of the *URL* the bytes came
+/// from — which is not necessarily the format they are in. The magic bytes win
+/// whenever they identify something: a JPEG stored as `.jxl` was served as
+/// `image/jxl`, which WebKitGTK has no decoder for, so the `<img>` never painted.
+fn media_type(path: &Path) -> Option<&'static str> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(16);
+    if let Ok(file) = std::fs::File::open(path) {
+        let _ = file.take(16).read_to_end(&mut head);
+    }
+    if let Some(sniffed) = sniff_media_type(&head) {
+        return Some(sniffed);
+    }
+    Some(content_type(&path.to_string_lossy()))
+}
+
+/// Format from the first bytes of a file, or `None` when they identify nothing.
+fn sniff_media_type(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if head.starts_with(b"\x89PNG") {
+        return Some("image/png");
+    }
+    if head.starts_with(b"GIF8") {
+        return Some("image/gif");
+    }
+    if head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if head.starts_with(&[0xFF, 0x0A]) || (head.len() >= 12 && &head[4..8] == b"JXL ") {
+        return Some("image/jxl");
+    }
+    if head.len() >= 12 && &head[4..8] == b"ftyp" {
+        return Some("video/mp4");
+    }
+    if head.starts_with(b"RIFF") && head.len() >= 12 && &head[8..12] == b"AVI " {
+        return Some("video/x-msvideo");
+    }
+    if head.starts_with(b"ID3") || head.starts_with(&[0xFF, 0xFB]) {
+        return Some("audio/mpeg");
+    }
+    if head.starts_with(b"%PDF") {
+        return Some("application/pdf");
+    }
+    None
 }
 
 pub fn userdata_dir() -> PathBuf {
@@ -776,8 +1601,10 @@ fn client_version_of(main_js: &[u8]) -> Option<String> {
 pub fn init_script(ctx: &AppContext, port: u16) -> String {
     let mut script = String::new();
     script.push_str(&format!(
-        "window.__OLAZ_LINUX = {{ port: {port}, debug: {}, devEval: {} }};\n",
-        ctx.debug, ctx.dev_eval
+        "window.__OLAZ_LINUX = {{ port: {port}, auxPort: {}, debug: {}, devEval: {} }};\n",
+        ctx.aux_port(),
+        ctx.debug,
+        ctx.dev_eval
     ));
     script.push_str(include_str!("../../web/olaz-linux.js"));
     script.push('\n');
@@ -827,6 +1654,76 @@ const HOST_SCRIPTS: &[(&str, &str)] = &[
     ("poll-adapter", include_str!("../../../Sources/Olaz/HostScripts/poll-adapter.js")),
     ("call-adapter", include_str!("../../../Sources/Olaz/HostScripts/call-adapter.js")),
 ];
+
+/// The browser-side half of macOS `EngineProbe`: the React fiber tree (what
+/// the official client actually mounted), feature detection and a DOM summary.
+/// Served by `/__olaz/dev/probe`, which is the Linux equivalent of the old
+/// `Olaz --engine-probe` final report.
+const DEV_PROBE_SCRIPT: &str = r##"
+const el = document.getElementById('app');
+const apis = JSON.stringify(Object.fromEntries([
+  'requestIdleCallback', 'cancelIdleCallback', 'BroadcastChannel', 'SharedWorker', 'OffscreenCanvas',
+  'createImageBitmap', 'showOpenFilePicker', 'CompressionStream', 'structuredClone'
+].map((k) => [k, typeof window[k]]).concat([
+  ['performance.memory', typeof performance.memory],
+  ['navigator.userAgentData', typeof navigator.userAgentData],
+  ['navigator.locks', typeof navigator.locks],
+  ['window.chrome', typeof window.chrome],
+  ['navigator.connection', typeof navigator.connection]
+])));
+let fibers = 'no #app';
+if (el) {
+  const key = Object.keys(el).find((k) => k.startsWith('__reactContainer') || k.startsWith('_reactRootContainer'));
+  const root = el._reactRootContainer ? el._reactRootContainer._internalRoot : (key ? el[key] : null);
+  const fiber = root && root.current ? root.current : root;
+  const lines = [];
+  const name = (f) => (f.type && (f.type.displayName || f.type.name)) || (typeof f.type === 'string' ? f.type : 'tag' + f.tag);
+  const walk = (f, d) => {
+    let n = 0;
+    while (f && lines.length < 160) {
+      const portal = f.tag === 4 ? (() => {
+        const c = f.stateNode && f.stateNode.containerInfo;
+        return c ? ' [portal → ' + c.nodeName + (c.id ? '#' + c.id : '') + '.' +
+          String(c.className || '').slice(0, 40) + ' connected=' + c.isConnected + ' kids=' +
+          c.childElementCount + ' parent=' + (c.parentNode ? c.parentNode.nodeName + '.' +
+          String(c.parentNode.className || '').slice(0, 30) : 'none') + ']' : '';
+      })() : '';
+      const susp = portal + (f.tag === 13 ? (f.memoizedState ? ' [SUSPENDED]' : ' [suspense ok]') : '');
+      const off = f.tag === 22 || f.tag === 23 ? ' [offscreen ' + JSON.stringify(f.memoizedProps && f.memoizedProps.mode) + ']' : '';
+      if (d < 40) lines.push('  '.repeat(Math.min(d, 20)) + name(f) + susp + off + (f.lanes ? ' lanes=' + f.lanes : ''));
+      if (f.child) walk(f.child, d + 1);
+      f = f.sibling;
+      if (++n > 30) break;
+    }
+  };
+  walk(fiber, 0);
+  fibers = 'ROOT pendingLanes=' + (root && root.pendingLanes) + ' callbackNode=' + !!(root && root.callbackNode) + '\n' + lines.join('\n');
+}
+const walkDom = (node, d) => {
+  if (!node || d > 7) return '';
+  const cs = getComputedStyle(node);
+  const tag = node.tagName.toLowerCase() + (node.id ? '#' + node.id : '') +
+    (node.className && typeof node.className === 'string' ? '.' + node.className.trim().split(/\s+/).slice(0, 3).join('.') : '');
+  const flags = (cs.display === 'none' ? ' [none]' : '') + (cs.visibility === 'hidden' ? ' [hidden]' : '') +
+    (cs.opacity === '0' ? ' [op0]' : '');
+  return '  '.repeat(d) + tag + flags + '\n' +
+    Array.from(node.children).slice(0, 12).map((child) => walkDom(child, d + 1)).join('');
+};
+const summary = [
+  'ELEMENTS ' + document.querySelectorAll('*').length + ' rootKids ' + (el ? el.children.length : 0),
+  ...Array.from(document.querySelectorAll('[class*=qr], [class*=login]')).slice(0, 25).map((e) =>
+    e.tagName + '.' + String(e.className).slice(0, 60) + ' ' +
+    Math.round(e.getBoundingClientRect().width) + 'x' + Math.round(e.getBoundingClientRect().height)),
+  JSON.stringify({
+    title: document.title,
+    text: document.body ? document.body.innerText.slice(0, 300) : '',
+    imgs: Array.from(document.images).map((i) => i.src.slice(0, 60)),
+    canvas: document.querySelectorAll('canvas').length
+  }),
+  document.body ? walkDom(document.body, 0).slice(0, 6000) : ''
+].join('\n');
+return { apis, fibers, summary };
+"##;
 
 /// Shown when no `app.asar` is configured: verifies the bridge end to end
 /// without VNG's bundle, which is what makes this port testable at all.
@@ -961,5 +1858,156 @@ const bridge = window.__zaloBridge || { callAsync: missing, callSync: () => { th
         "location.assign('/app/login.html');",
         &format!("location.assign({});", Value::String(login_url.to_string())),
     )
+}
+
+#[cfg(test)]
+mod local_file_tests {
+    use super::{parse_range, sniff_media_type};
+
+    #[test]
+    fn range_parses_the_shapes_a_media_element_sends() {
+        // A closed range, clamped to the file: 100 bytes, `bytes=10-999`.
+        assert_eq!(parse_range("bytes=10-999", 100), Some(Some((10, 99))));
+        // Open-ended: everything from 40 on.
+        assert_eq!(parse_range("bytes=40-", 100), Some(Some((40, 99))));
+        // Suffix: the last 25 bytes.
+        assert_eq!(parse_range("bytes=-25", 100), Some(Some((75, 99))));
+        // Whole file.
+        assert_eq!(parse_range("bytes=0-99", 100), Some(Some((0, 99))));
+    }
+
+    #[test]
+    fn range_past_the_end_is_unsatisfiable() {
+        assert_eq!(parse_range("bytes=100-", 100), Some(None));
+        assert_eq!(parse_range("bytes=200-300", 100), Some(None));
+        assert_eq!(parse_range("bytes=-0", 100), Some(None));
+        assert_eq!(parse_range("bytes=0-", 0), Some(None));
+    }
+
+    #[test]
+    fn range_ignores_what_it_cannot_answer() {
+        // A multi-range answer needs a multipart body; the caller sends the whole file.
+        assert_eq!(parse_range("bytes=0-1,5-6", 100), None);
+        assert_eq!(parse_range("items=0-1", 100), None);
+        assert_eq!(parse_range("bytes=abc-def", 100), None);
+        assert_eq!(parse_range("bytes", 100), None);
+    }
+
+    #[test]
+    fn magic_bytes_beat_a_misleading_extension() {
+        // A JPEG cached under a `.jxl` name (the URL said jxl, the CDN sent JPEG) used to
+        // be served as `image/jxl`, which WebKitGTK cannot decode.
+        assert_eq!(sniff_media_type(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(sniff_media_type(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
+        assert_eq!(sniff_media_type(b"GIF89a"), Some("image/gif"));
+        let mut mp4 = vec![0u8, 0, 0, 0x1C];
+        mp4.extend_from_slice(b"ftypmp42");
+        assert_eq!(sniff_media_type(&mp4), Some("video/mp4"));
+        // An expired link answers HTML: nothing identifies it, so the extension decides.
+        assert_eq!(sniff_media_type(b"<!DOCTYPE html>"), None);
+    }
+}
+
+#[cfg(test)]
+mod sync_patch_tests {
+    use super::{
+        expose_webpack_require, patch_sync_asset, patch_sync_global_id_resolver, patch_sync_insert_error,
+        patch_sync_insert_success, patch_worker_pool_timeout,
+    };
+
+    #[test]
+    fn dal_worker_gets_the_database_prelude() {
+        let out = patch_sync_asset("dal-worker.abc.js", b"official".to_vec());
+        assert!(out.starts_with(b"\n(() => {"));
+        assert!(out.ends_with(b"\nofficial"));
+        assert!(String::from_utf8_lossy(&out).contains("__swReq"));
+    }
+
+    #[test]
+    fn sync_sub_worker_exposes_its_require() {
+        let input = b"x}i.e=function(e){var t=[],n=a[e];".to_vec();
+        let out = String::from_utf8(expose_webpack_require(input)).unwrap();
+        assert!(out.contains("}self.__swReq=i;i.e=function"));
+    }
+
+    #[test]
+    fn main_startup_resolver_gets_the_global_id_fallback() {
+        let input = b"cI.oneToOnePCNoised2gNoised=async e=>{return await cI.resolveWithRetry(e,(e=>eo.default.getGlobalIdsFromUserIds(e)))};".to_vec();
+        let out = String::from_utf8(patch_sync_global_id_resolver(input)).unwrap();
+        assert!(out.contains("__swzGlobalIdFallback"));
+        assert!(out.contains("cI.resolveWithRetry(e,(async e=>"));
+    }
+
+    #[test]
+    fn insert_error_is_forwarded() {
+        let input = b"catch(n){throw this.logger.zsymb(18,\"cEXelp\",\"Error when insert messages to db\",n),n}".to_vec();
+        let out = String::from_utf8(patch_sync_insert_error(input)).unwrap();
+        assert!(out.contains("insertToDb-failed"));
+    }
+
+    #[test]
+    fn sync_worker_pool_gets_a_linux_task_budget() {
+        let input = b"class wl{constructor(e,t=2,s=1,r=0,i=1e4){this.route=e,this.taskTimeout=i,this.workers=[]}}".to_vec();
+        let out = String::from_utf8(patch_sync_asset("app/lazy/chunk.abc.js", input)).unwrap();
+        assert!(out.contains("this.taskTimeout=Math.max(i,1.2e5),this.workers=[]"));
+        assert!(!out.contains("this.taskTimeout=i,"));
+    }
+
+    #[test]
+    fn insert_counts_are_forwarded() {
+        let input = b"xconst a=await this.insertMessage(e);y".to_vec();
+        let out = String::from_utf8(patch_sync_insert_success(input)).unwrap();
+        assert!(out.contains("insert-msgs"));
+        assert!(out.contains("insertMessage(e);self.__zhostFwd"));
+        assert!(!out.contains(",,"));
+        // A stray paren/comma here makes the whole sub-worker fail to parse,
+        // which surfaces as MSG_IMPORT_FAILED at sync time.
+        assert_eq!(out.matches('(').count(), out.matches(')').count());
+        assert_eq!(out.matches('{').count(), out.matches('}').count());
+    }
+
+    #[test]
+    fn sync_sub_worker_gets_a_log_forwarder() {
+        let out = String::from_utf8(patch_sync_asset("sync-v2-sub-worker.abc.js", b"official".to_vec())).unwrap();
+        assert!(out.starts_with("\n(() => {"));
+        assert!(out.contains("self.__zhostFwd"));
+        assert!(out.contains("/__olaz/log"));
+        assert!(out.ends_with("official"));
+    }
+
+    #[test]
+    fn worker_pool_patch_leaves_other_bundles_alone() {
+        let input = b"const a=1;this.workers=[]".to_vec();
+        assert_eq!(patch_worker_pool_timeout(input.clone()), input);
+    }
+
+    #[test]
+    fn resolver_patch_leaves_an_unknown_shape_alone() {
+        let input = b"cI.resolveWithRetry(e,e=>eo.default.getGlobalIdsFromUserIds(e))".to_vec();
+        let out = patch_sync_global_id_resolver(input.clone());
+        assert_eq!(out, input, "a call without the arrow-argument parentheses must not be patched");
+    }
+}
+
+#[cfg(test)]
+mod dev_harness_tests {
+    use super::dev_target;
+
+    #[test]
+    fn dev_target_defaults_to_main() {
+        assert_eq!(dev_target(None).unwrap(), "main");
+        assert_eq!(dev_target(Some("main")).unwrap(), "main");
+    }
+
+    #[test]
+    fn dev_target_accepts_both_worker_names() {
+        assert_eq!(dev_target(Some("worker")).unwrap(), "shared-worker");
+        assert_eq!(dev_target(Some("shared-worker")).unwrap(), "shared-worker");
+    }
+
+    #[test]
+    fn dev_target_rejects_unknown_targets() {
+        assert!(dev_target(Some("renderer")).is_err());
+    }
 }
 

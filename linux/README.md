@@ -123,6 +123,7 @@ mở nên không có việc đổi fingerprint giữa phiên.
 | `OLAZ_USERDATA` | thư mục dữ liệu (mặc định `$XDG_DATA_HOME/olaz`) |
 | `OLAZ_CLIENT_VERSION` | ghi đè `client_version` khi không đọc được từ `main-dist/main.js` |
 | `OLAZ_DEBUG=1` | log request mạng, state, các member/kênh chưa cài |
+| `OLAZ_DEV_EVAL=1` | bật dev harness trong bản release; build debug mặc định bật (đặt `0` để tắt) |
 | `OLAZ_AUTO_FETCH=0` | không tự tải runtime khi chưa có |
 | `OLAZ_AUTO_UPDATE=0` | không tự tải bản runtime mới hơn (mặc định bật) |
 | `OLAZ_INSTALLER` | cài từ bộ cài cục bộ thay vì tải (`.dmg`/`.exe`/`.zip`) |
@@ -237,18 +238,47 @@ Chưa có (khác bản macOS):
 
 ### Developer harness (Linux)
 
-Bản macOS có `Olaz --engine-probe`; bản Linux có cùng ý tưởng ở dạng endpoint loopback, chỉ mở khi
-đặt `OLAZ_DEV_EVAL=1`:
+Bản macOS có `Olaz --engine-probe` và dev channel đọc file trong `<data>/dev`; bản Linux port đầy đủ
+các tool đó. Harness **bật mặc định trong build debug**; bản release chỉ mở khi đặt `OLAZ_DEV_EVAL=1`.
+Đặt `OLAZ_DEV_EVAL=0` để tắt cả trong build debug:
 
 ```bash
+# build debug: harness tự bật
+DISPLAY=:0 OLAZ_DEBUG=1 cargo run --manifest-path linux/src-tauri/Cargo.toml
+
+# AppImage/release: phải bật rõ ràng
 DISPLAY=:0 OLAZ_DEBUG=1 OLAZ_DEV_EVAL=1 linux/dist/Olaz_1.0.0_amd64.AppImage
-curl -s -X POST localhost:27182/__olaz/dev/eval \
-  -d '{"code":"return {title: document.title, text: document.body.innerText.slice(0, 300)}"}'
 ```
 
-JS chạy trong main renderer (không phải shared-worker), kết quả trả về trong `result` dưới dạng JSON.
-Endpoint trả 403 khi không bật và không ghi code/kết quả vào log. Dùng để kiểm tra DOM, store và chat
-detail khi không chụp được màn hình.
+HTTP:
+
+```bash
+# Chạy trong main renderer (mặc định) hoặc shared-worker ẩn
+curl -s -X POST localhost:27182/__olaz/dev/eval \
+  -d '{"code":"return {title: document.title, text: document.body.innerText.slice(0, 300)}"}'
+curl -s -X POST localhost:27182/__olaz/dev/eval \
+  -d '{"target":"worker","code":"return 6*7"}'
+
+# Fiber React, feature detection và DOM summary — tương đương --engine-probe
+curl -s localhost:27182/__olaz/dev/probe
+```
+
+Kết quả nằm trong `result` (JSON string); endpoint trả 403 khi không bật và không ghi code/kết quả
+vào log. `target` nhận `main` hoặc `worker`/`shared-worker`.
+
+File tools, giống bản macOS (thư mục `<userData>/dev`, mặc định `~/.local/share/olaz/dev`):
+
+| file | tác dụng |
+|---|---|
+| `eval.js` | chạy trong main renderer khi file đổi; ghi `eval.out.json` |
+| `worker-eval.js` | chạy trong shared-worker ẩn; ghi `worker-eval.out.json` |
+| `open-conv.txt` | chứa conversation id; mở cuộc trò chuyện đó một lần rồi xoá file |
+| `compose.json` | chạy một composer action; ghi `compose.out.txt` |
+
+`compose.json` có dạng `{"method":"myCard","args":[],"files":[]}`. Với `files`, harness đọc
+đường dẫn qua `$zFileManager`, tạo `File` và inject vào input ẩn mà composer adapter bấm — không mở
+hộp thoại chọn file. `method:"screenshot"` trả `unsupported` vì `ZaloCap`/`ScreenCapture` chưa port sang
+Linux. Dùng để kiểm tra DOM, store, chat detail và các action soạn tin khi không chụp được màn hình.
 
 ## Kiểm thử
 
