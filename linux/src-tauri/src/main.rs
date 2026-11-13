@@ -46,6 +46,11 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // Dock icon + minimize: install the desktop entry and icons from the
+    // AppImage before the window opens, so the shell can match the window's
+    // `app_id`/`WM_CLASS` to an installed application. No-op outside an
+    // AppImage (cargo run skips it).
+    host::install_desktop_entry();
     eprintln!(
         "[olaz] bridge: http://127.0.0.1:{}  entry: {}  userData: {}",
         running.port,
