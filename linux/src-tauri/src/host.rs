@@ -79,11 +79,19 @@ impl RuntimeState {
 pub struct Events {
     state: Mutex<(u64, VecDeque<Value>)>,
     signal: Condvar,
+    /// Control events (dev-eval) that must never be dropped by the ring
+    /// buffer: keyed by id, delivered once to the window they name, removed
+    /// on delivery (the page posts the result to `/__olaz/dev/eval-result`).
+    control: Mutex<VecDeque<(u64, String, Value)>>,
 }
 
 impl Events {
     pub fn new() -> Self {
-        Self { state: Mutex::new((0, VecDeque::new())), signal: Condvar::new() }
+        Self {
+            state: Mutex::new((0, VecDeque::new())),
+            signal: Condvar::new(),
+            control: Mutex::new(VecDeque::new()),
+        }
     }
 
     pub fn push(&self, mut event: Value) {
@@ -94,10 +102,38 @@ impl Events {
             object.insert("seq".into(), json!(seq));
         }
         state.1.push_back(event);
-        while state.1.len() > 512 {
+        while state.1.len() > 4096 {
             state.1.pop_front();
         }
         self.signal.notify_all();
+    }
+
+    /// Queues a control event for one window. Unlike the broadcast ring these
+    /// are never dropped: the sync machine and the diagnostics tooling drive
+    /// the renderer through them, and a flood of realtime events must not
+    /// starve that channel.
+    pub fn push_control(&self, id: u64, target: &str, event: Value) {
+        self.control
+            .lock()
+            .unwrap()
+            .push_back((id, target.to_string(), event));
+        self.signal.notify_all();
+    }
+
+    /// Removes and returns the control events addressed to `window`.
+    pub fn drain_control(&self, window: &str) -> Vec<Value> {
+        let mut queue = self.control.lock().unwrap();
+        let mut kept = VecDeque::new();
+        let mut out = Vec::new();
+        for (id, target, event) in queue.drain(..) {
+            if target == window {
+                out.push(event);
+            } else {
+                kept.push_back((id, target, event));
+            }
+        }
+        *queue = kept;
+        out
     }
 
     /// Events after `cursor`; blocks up to `timeout` for the first one.
@@ -256,12 +292,11 @@ impl AppContext {
         let id = self.dev_eval_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let (sender, receiver) = mpsc::channel();
         self.dev_eval_waiters.lock().unwrap().insert(id, sender);
-        self.events.push(json!({
-            "kind": "dev-eval",
-            "id": id,
-            "code": code,
-            "target": target
-        }));
+        self.events.push_control(
+            id,
+            target,
+            json!({ "kind": "dev-eval", "id": id, "code": code, "target": target }),
+        );
         match receiver.recv_timeout(timeout) {
             Ok(result) => Ok(result),
             Err(_) => {
@@ -998,7 +1033,16 @@ fn handle(ctx: &Arc<AppContext>, mut request: Request) {
     match (request.method().clone(), path.as_str()) {
         (Method::Get, "/poll") => {
             let cursor = param(&query, "cursor").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-            let (cursor, events) = ctx.events.since(cursor, Duration::from_millis(20_000));
+            let poller = param(&query, "win").unwrap_or_else(|| window.clone());
+            let (cursor, mut events) = ctx.events.since(cursor, Duration::from_millis(20_000));
+            // Control events (dev-eval) ride along first: they are queued
+            // per-window and must survive a realtime-event flood that would
+            // evict them from the broadcast ring.
+            let mut control = ctx.events.drain_control(&poller);
+            if !control.is_empty() && ctx.debug {
+                eprintln!("[poll] {} nhận {} control event(s)", poller, control.len());
+            }
+            events.splice(0..0, control.drain(..));
             reply(request, 200, "application/json", json!({ "cursor": cursor, "events": events }).to_string());
         }
         (Method::Get, "/__olaz/boot.js") => {

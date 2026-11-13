@@ -1556,8 +1556,10 @@
   };
   const poll = () => {
     // No custom headers: a cross-origin GET with `content-type: application/json`
-    // would trigger a CORS preflight on every poll.
-    nativeFetch(base2 + '/poll?cursor=' + cursor)
+    // would trigger a CORS preflight on every poll. `win` tells the host which
+    // window is asking, so per-window control events (dev-eval) reach the
+    // right page even when the broadcast ring is flooded.
+    nativeFetch(base2 + '/poll?cursor=' + cursor + '&win=' + win)
       .then((res) => res.json())
       .then((body) => {
         if (typeof body.cursor === 'number') cursor = body.cursor;
