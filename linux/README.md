@@ -266,6 +266,22 @@ curl -s localhost:27182/__olaz/dev/probe
 Kết quả nằm trong `result` (JSON string); endpoint trả 403 khi không bật và không ghi code/kết quả
 vào log. `target` nhận `main` hoặc `worker`/`shared-worker`.
 
+### Đồng bộ tin nhắn (Điện thoại → PC)
+
+Luồng sync chính thức của Zalo chạy qua cloud: PC gọi sync → điện thoại xác
+nhận trên app Zalo → dữ liệu kéo về qua `transfersync.zaloapp.com` và ghi vào
+IndexedDB bởi DAL worker. Điều khiển từ loopback (không cần `OLAZ_DEV_EVAL`):
+
+```bash
+curl -s localhost:27182/__olaz/transfer          # trạng thái (enabled/running/canSync)
+curl -s -X POST localhost:27182/__olaz/transfer/start   # bắt đầu sync (điện thoại sẽ nhận yêu cầu xác nhận)
+curl -s -X POST localhost:27182/__olaz/transfer/cancel  # huỷ sync đang chạy
+```
+
+Trong UI chính thức, card "Đồng bộ tin nhắn" ở **Cài đặt** cũng dùng được như
+bản macOS. Ảnh của tin mới import được photo warmer tự tải (theo dõi số dòng
+store, chạy lại khi có ≥ 20 dòng mới).
+
 File tools, giống bản macOS (thư mục `<userData>/dev`, mặc định `~/.local/share/olaz/dev`):
 
 | file | tác dụng |

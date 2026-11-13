@@ -1040,6 +1040,75 @@ fn handle(ctx: &Arc<AppContext>, mut request: Request) {
             let state = ctx.runtime.lock().unwrap().json();
             reply(request, 200, "application/json", state.to_string());
         }
+        // Local-only control surface for the phone→PC message sync: the sync
+        // machine lives in the renderer, so these routes drive it through the
+        // dev-eval channel. Loopback-only, so no extra gating beyond the
+        // renderer being up (an idle renderer answers "not ready").
+        (Method::Get, "/__olaz/transfer") => {
+            const STATE_CODE: &str = r#"
+const di = window.__zaloDI;
+let ui2 = null, m2 = null, ctl = null;
+for (const r of di(window.__zaloRequire)) {
+  const i = r.instance;
+  if (!i || typeof i !== 'object') continue;
+  if (i.name === 'sync-ui-service') ui2 = i;
+  if (typeof i.isFeatureEnabledBySyncSource === 'function' && typeof i.sync === 'function') m2 = i;
+  if (typeof i.needTransferMessages === 'function') ctl = i;
+}
+if (!m2) throw new Error('sync module chưa sẵn sàng');
+return JSON.stringify({
+  enabled: m2.isFeatureEnabledBySyncSource(6),
+  running: m2.isSyncRunning(),
+  canSync: m2.canSync(6),
+  shouldTransfer: ctl ? ctl.shouldTransferMessages() : null,
+  ui: ui2 && ui2.getState ? ui2.getState() : null,
+});
+"#;
+            match ctx.dev_eval("main", STATE_CODE, DEV_EVAL_TIMEOUT) {
+                Ok(result) => reply(request, 200, "application/json", result),
+                Err(error) => reply(request, 503, "application/json", json!({ "ok": false, "error": error }).to_string()),
+            }
+        }
+        (Method::Post, "/__olaz/transfer/start") => {
+            match ctx.dev_eval(
+                "main",
+                r#"
+const di = window.__zaloDI;
+let m2 = null;
+for (const r of di(window.__zaloRequire)) {
+  const i = r.instance;
+  if (i && typeof i === 'object' && typeof i.isFeatureEnabledBySyncSource === 'function' && typeof i.sync === 'function') { m2 = i; break; }
+}
+if (!m2) throw new Error('sync module chưa sẵn sàng');
+m2.sync(6);
+return JSON.stringify({ started: true, running: m2.isSyncRunning() });
+"#,
+                DEV_EVAL_TIMEOUT,
+            ) {
+                Ok(result) => reply(request, 200, "application/json", result),
+                Err(error) => reply(request, 503, "application/json", json!({ "ok": false, "error": error }).to_string()),
+            }
+        }
+        (Method::Post, "/__olaz/transfer/cancel") => {
+            match ctx.dev_eval(
+                "main",
+                r#"
+const di = window.__zaloDI;
+let m2 = null;
+for (const r of di(window.__zaloRequire)) {
+  const i = r.instance;
+  if (i && typeof i === 'object' && typeof i.isFeatureEnabledBySyncSource === 'function' && typeof i.sync === 'function') { m2 = i; break; }
+}
+if (!m2) throw new Error('sync module chưa sẵn sàng');
+m2.cancelSyncIfRunning('USER_CANCELLED');
+return JSON.stringify({ cancelled: true, running: m2.isSyncRunning() });
+"#,
+                DEV_EVAL_TIMEOUT,
+            ) {
+                Ok(result) => reply(request, 200, "application/json", result),
+                Err(error) => reply(request, 503, "application/json", json!({ "ok": false, "error": error }).to_string()),
+            }
+        }
         (Method::Post, "/__olaz/dev/eval") => {
             if !ctx.dev_eval {
                 reply(request, 403, "application/json", json!({ "error": "OLAZ_DEV_EVAL chưa bật" }).to_string());

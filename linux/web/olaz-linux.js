@@ -132,7 +132,10 @@
     // The sync import keeps rewriting rows as ciphertext after the first pass,
     // so re-scan on a slow cadence. The pass only rewrites rows that still
     // need it, and the warmer only re-runs when something was repaired.
-    setInterval(() => decryptMessagesOnce(userId, uin), 90000);
+    // The 90 s re-scan moved into the message-growth watcher below: at 130k
+    // rows a pass reads the whole store and stalls the main thread — running
+    // it unconditionally was the visible lag, and rows only change when new
+    // messages arrive anyway.
   };
   window.__olazLinux.decryptMessagesOnce = decryptMessagesOnce;
   // The bridge replays the session on `renderer-ready`, but that can land after
@@ -263,6 +266,10 @@
     window.__olazPhotoWarm = true;
     try {
       const rows = await readMessageRows(userId);
+      // Newest first: the store key order is not recency, and after a phone→PC
+      // sync the oldest rows' CDN URLs have long expired — warming those first
+      // burns the whole budget (400) on dead links.
+      rows.sort((a, b) => (Number(b && b.sendDttm) || 0) - (Number(a && a.sendDttm) || 0));
       const targets = photoTargets(rows, userId);
       if (!targets.length) {
         const objects = (rows || []).filter((row) => row && row.message && typeof row.message === 'object').length;
@@ -326,6 +333,54 @@
   };
   for (const delay of [1000, 3000, 6000, 12000]) setTimeout(trackConversation, delay);
   window.__olazLinux.warmPhotoCaches = warmPhotoCaches;
+
+  // ---------------------------------------------------- warmer re-arm on growth
+  // Messages land in the store long after boot: the phone→PC sync imports tens
+  // of thousands over many minutes, and realtime messages arrive continuously.
+  // The warmer runs once per launch, so synced history would never get
+  // thumbnails. Watch the message-store row count — a cheap `count()` query —
+  // and re-run the warmer whenever a batch of new rows appeared.
+  const scheduleWarmerOnGrowth = (userId, uin) => {
+    if (!userId || window.__olazGrowthWatch) return;
+    window.__olazGrowthWatch = true;
+    let lastCount = 0;
+    const countRows = () => new Promise((resolve) => {
+      const request = indexedDB.open('zdb_' + userId);
+      request.onerror = () => resolve(0);
+      request.onsuccess = () => {
+        const db = request.result;
+        let count = 0;
+        try {
+          const query = db.transaction('message', 'readonly').objectStore('message').count();
+          query.onsuccess = () => { count = query.result; };
+        } catch (e) {}
+        setTimeout(() => { db.close(); resolve(count); }, 50);
+      };
+    });
+    const tick = async () => {
+      try {
+        const count = await countRows();
+        const grew = count - lastCount;
+        if (lastCount > 0 && grew >= 20) {
+          report('message store +' + grew + ' dòng — chạy lại photo warmer');
+          // New rows may be XOR-encrypted (the sync import writes them that
+          // way); decrypt first — it re-arms the warmer when it fixed rows.
+          try { if (uin) decryptMessagesOnce(userId, uin); } catch (e) {}
+          try { warmPhotoCaches(userId); } catch (e) {}
+        }
+        lastCount = count;
+      } catch (e) {}
+    };
+    setTimeout(tick, 30000);
+    setInterval(tick, 60000);
+  };
+  const scheduleWarmerOnGrowthWrap = () => {
+    const session = (() => { try { return JSON.parse(localStorage.getItem('sh_olaz_session') || 'null'); } catch (e) { return null; } })();
+    if (session && session.userId) scheduleWarmerOnGrowth(String(session.userId), String(session.UIN || ''));
+    return false;
+  };
+  scheduleWarmerOnGrowthWrap();
+  for (const delay of [5000, 15000, 30000]) setTimeout(scheduleWarmerOnGrowthWrap, delay);
 
   // ------------------------------------------ resolveMedia through the cache
   // The official photo path (multi-source `loadPC`) throws inside its module
