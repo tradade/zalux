@@ -70,21 +70,19 @@ jobs:
         id: collect
         run: |
           mkdir -p out
-          # Build chạy trong `linux/`, nên thư mục target nằm ở
-          # `linux/src-tauri/target/` — tìm từ root cho khỏi đoán.
-          src=$(find . -name '*.AppImage' -not -path './.git/*' | head -n 1)
-          test -n "$src" || { echo 'không tìm thấy AppImage sau build' >&2; exit 1; }
-          name="Olaz-${GITHUB_REF_NAME}-amd64.AppImage"
-          cp "$src" "out/$name"
-          sha256sum "out/$name" > out/SHA256SUMS
-          echo "ARTIFACT_NAME=$name" >> "$GITHUB_ENV"
-          echo "artifact=$name" >> "$GITHUB_OUTPUT"
+          # Build chạy trong `linux/`, nên thư mục bundle nằm ở
+          # `linux/src-tauri/target/release/bundle/` — tìm từ root cho khỏi đoán.
+          find . -name '*.AppImage' -not -path './.git/*' -exec cp {} out/ \;
+          find . -name '*.deb' -not -path './.git/*' -exec cp {} out/ \;
+          ls out/ | grep -q . || { echo 'không tìm thấy package sau build' >&2; exit 1; }
+          (cd out && sha256sum *.AppImage *.deb > SHA256SUMS)
+          echo "artifact=Olaz-linux-packages" >> "$GITHUB_OUTPUT"
           cat out/SHA256SUMS
 
       - name: Upload artefact (mọi lần chạy)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
+          name: Olaz-linux-packages
           path: out/
 
   release:
@@ -120,4 +118,5 @@ jobs:
             của bạn và tự chịu rủi ro theo ToS của Zalo.
           files: |
             out/*.AppImage
+            out/*.deb
             out/SHA256SUMS

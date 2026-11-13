@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Builds the Olaz AppImage for Linux.
+# Builds the Olaz Linux packages: AppImage + .deb.
 #
-#   linux/scripts/build-appimage.sh
+#   linux/scripts/build-appimage.sh              # cả hai
+#   linux/scripts/build-appimage.sh --bundles appimage
 #
 # Tauri needs its CLI; this uses `npx @tauri-apps/cli` so nothing global is
 # installed. `app.asar` is NOT bundled — the user points OLAZ_ASAR at their own
@@ -19,7 +20,11 @@ fi
 # usr/bin/olaz-fingerprint-helper, next to the app binary.
 "$(dirname "$0")/build-fingerprint-helper.sh"
 
+# Default to both bundles; the caller can override with --bundles.
+if [[ "$*" != *--bundles* ]]; then
+  set -- --bundles "appimage,deb" "$@"
+fi
+
 exec npx --yes @tauri-apps/cli@2 build \
   --config src-tauri/tauri.conf.json \
-  --bundles appimage \
   "$@"
