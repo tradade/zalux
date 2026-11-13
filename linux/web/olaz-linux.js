@@ -611,34 +611,160 @@
     } catch (e) {}
     return fixed;
   };
-  // Own lightbox: the official viewer only opens when its loader holds pixels.
-  // Since the loader's bytes come from our cache anyway, show the same JPEG
-  // in a minimal overlay — thumbnail clicks always open something viewable.
+  // Own lightbox: the official viewer renders in an Electron child window
+  // (`photoviewer_popup_mode == 2` → `/popup-viewer.html`), which this host
+  // does not have, so a thumbnail click did nothing. Open our own overlay:
+  // the gallery is every photo bubble currently mounted, arrow keys and the
+  // side buttons navigate, and the largest cached variant wins (try `_o`,
+  // fall back to the thumbnail the bubble is already showing).
+  const lightboxState = { items: [], index: 0 };
+  const lightboxUpgrade = (src) => {
+    if (src.indexOf('/Cache/') < 0) return [src];
+    const candidates = [];
+    for (const quality of ['_o', '_h']) {
+      const upgraded = src.replace(/_(t|n|h|o)(\.[a-z0-9]+)?(\?|$)/i, quality + '$2$3');
+      if (upgraded !== src && candidates.indexOf(upgraded) < 0) candidates.push(upgraded);
+    }
+    candidates.push(src);
+    return candidates;
+  };
+  const lightboxClose = () => {
+    const box = document.getElementById('__olazLightbox');
+    if (box) box.remove();
+    lightboxState.items = [];
+    window.removeEventListener('keydown', lightboxKeys, true);
+  };
+  const lightboxKeys = (ev) => {
+    if (ev.key === 'Escape') { lightboxClose(); return; }
+    if (lightboxState.items.length < 2) return;
+    if (ev.key === 'ArrowLeft') { lightboxShow(lightboxState.index - 1); ev.preventDefault(); }
+    if (ev.key === 'ArrowRight') { lightboxShow(lightboxState.index + 1); ev.preventDefault(); }
+  };
+  const lightboxShow = (index) => {
+    const box = document.getElementById('__olazLightbox');
+    if (!box || !lightboxState.items.length) return;
+    const total = lightboxState.items.length;
+    lightboxState.index = ((index % total) + total) % total;
+    const src = lightboxState.items[lightboxState.index];
+    const img = box.querySelector('img');
+    const counter = box.querySelector('[data-counter]');
+    if (counter) counter.textContent = (lightboxState.index + 1) + '/' + total;
+    if (!img) return;
+    const candidates = lightboxUpgrade(src);
+    let at = 0;
+    img.style.opacity = '0.4';
+    img.onerror = () => {
+      at += 1;
+      if (at < candidates.length) img.src = candidates[at];
+      else img.onerror = null;
+    };
+    img.onload = () => { img.style.opacity = '1'; };
+    img.src = candidates[0];
+  };
   const openOlazLightbox = (local, caption) => {
     try {
-      let box = document.getElementById('__olazLightbox');
-      if (box) box.remove();
-      box = document.createElement('div');
+      lightboxClose();
+      const seen = new Set();
+      const items = [];
+      for (const el of document.querySelectorAll('.img-center-box img')) {
+        const src = el.currentSrc || el.src || '';
+        if (src.indexOf('/__olaz/file') < 0 || el.naturalWidth === 0) continue;
+        const path = decodeURIComponent((src.split('path=')[1] || '').split('&')[0]);
+        if (seen.has(path)) continue;
+        seen.add(path);
+        items.push(src);
+      }
+      if (!items.length) items.push(local);
+      let index = items.indexOf(local);
+      if (index < 0) { items.unshift(local); index = 0; }
+      lightboxState.items = items;
+      lightboxState.index = index;
+      const box = document.createElement('div');
       box.id = '__olazLightbox';
       box.setAttribute(
         'style',
-        'position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,.85);' +
-          'display:flex;align-items:center;justify-content:center;cursor:zoom-out;',
+        'position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,.88);' +
+          'display:flex;align-items:center;justify-content:center;cursor:zoom-out;user-select:none;',
       );
       const img = document.createElement('img');
-      img.src = local;
       img.alt = caption || 'photo';
       img.setAttribute(
         'style',
-        'max-width:92vw;max-height:90vh;object-fit:contain;border-radius:8px;' +
-          'box-shadow:0 8px 60px rgba(0,0,0,.6);',
+        'max-width:92vw;max-height:88vh;object-fit:contain;border-radius:8px;' +
+          'box-shadow:0 8px 60px rgba(0,0,0,.6);transition:opacity .15s;',
       );
       box.appendChild(img);
-      box.addEventListener('click', () => { try { box.remove(); } catch (e) {} });
+      const mkButton = (text, side) => {
+        if (items.length < 2) return null;
+        const b = document.createElement('div');
+        b.textContent = text;
+        b.setAttribute(
+          'style',
+          'position:absolute;top:50%;' + side + ':24px;transform:translateY(-50%);' +
+            'width:44px;height:44px;line-height:44px;text-align:center;border-radius:50%;' +
+            'background:rgba(255,255,255,.12);color:#fff;font-size:26px;cursor:pointer;',
+        );
+        b.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          lightboxShow(lightboxState.index + (text === '‹' ? -1 : 1));
+        });
+        return b;
+      };
+      const prev = mkButton('‹', 'left');
+      if (prev) box.appendChild(prev);
+      const next = mkButton('›', 'right');
+      if (next) box.appendChild(next);
+      if (items.length > 1) {
+        const counter = document.createElement('div');
+        counter.setAttribute('data-counter', '1');
+        counter.setAttribute(
+          'style',
+          'position:absolute;bottom:18px;left:50%;transform:translateX(-50%);' +
+            'color:rgba(255,255,255,.85);font-size:14px;background:rgba(0,0,0,.4);' +
+            'padding:4px 12px;border-radius:12px;cursor:default;',
+        );
+        box.appendChild(counter);
+      }
+      const close = document.createElement('div');
+      close.textContent = '×';
+      close.setAttribute(
+        'style',
+        'position:absolute;top:14px;right:20px;color:#fff;font-size:30px;' +
+          'cursor:pointer;width:40px;height:40px;line-height:40px;text-align:center;',
+      );
+      close.addEventListener('click', (ev) => { ev.stopPropagation(); lightboxClose(); });
+      box.appendChild(close);
+      box.addEventListener('click', (ev) => {
+        if (ev.target === box) lightboxClose();
+      });
       document.body.appendChild(box);
+      window.addEventListener('keydown', lightboxKeys, true);
+      lightboxShow(index);
       report('modal ảnh: mở ' + String(local).slice(-60));
     } catch (e) {}
   };
+  // The official viewer needs a child window, so route bubble-photo clicks to
+  // the lightbox instead. Capture phase, before the component's own handler;
+  // skipped while multi-select is active (clicks pick messages there).
+  document.addEventListener(
+    'click',
+    (ev) => {
+      try {
+        const img = ev.target;
+        if (!img || img.tagName !== 'IMG') return;
+        const src = img.currentSrc || img.src || '';
+        if (src.indexOf(base2 + '/__olaz/file') < 0 && src.indexOf(base + '/__olaz/file') < 0) return;
+        if (!img.closest('.img-center-box')) return;
+        if (document.querySelector('[class*=multisel]:not([class*="false"]), [class*=multi-select]')) {
+          if (img.closest('[class*=selected]')) return;
+        }
+        ev.preventDefault();
+        ev.stopPropagation();
+        openOlazLightbox(src, '');
+      } catch (e) {}
+    },
+    true,
+  );
   // Last resort when the official loader holds no pixels (expired CDN, JXL it
   // cannot decode, or a `file://` read WebKitGTK blocks): paint our warmed
   // JPEG into the bubble box directly. Matching prefers a cliMsgId found in

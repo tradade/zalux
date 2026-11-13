@@ -1406,10 +1406,57 @@ fn reply_local_file(request: Request, local: LocalFile) {
         .iter()
         .find(|header| header.field.equiv("Range"))
         .map(|header| header.value.as_str().to_string());
+    let if_none_match = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("If-None-Match"))
+        .map(|header| header.value.as_str().to_string());
+    // Media files are written atomically and never edited in place, so a strong
+    // validator from size+mtime is stable. Without it WebKit re-downloads every
+    // bubble image on each remount — the visible "lag" when scrolling back.
+    let etag = std::fs::metadata(&local.path)
+        .map(|meta| {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            format!("\"{:x}-{:x}\"", local.length, mtime)
+        })
+        .unwrap_or_default();
+    let cache_headers = |mut response: Response<std::io::Cursor<Vec<u8>>>| {
+        if let Ok(header) = Header::from_bytes(
+            &b"Cache-Control"[..],
+            &b"private, max-age=31536000, immutable"[..],
+        ) {
+            response.add_header(header);
+        }
+        if !etag.is_empty() {
+            if let Ok(header) =
+                Header::from_bytes(&b"ETag"[..], etag.as_bytes())
+            {
+                response.add_header(header);
+            }
+        }
+        response
+    };
     let headers = |mut response: Response<_>| {
         response.add_header(accept_ranges());
         response
     };
+    // A conditional request without a Range wants `304` when nothing changed.
+    if range.is_none() && !etag.is_empty() {
+        if let Some(value) = &if_none_match {
+            if value.split(',').any(|tag| tag.trim() == etag) {
+                let not_modified = Response::empty(304)
+                    .with_header(accept_ranges())
+                    .with_header(Header::from_bytes(&b"ETag"[..], etag.as_bytes()).unwrap());
+                let _ = request.respond(not_modified);
+                return;
+            }
+        }
+    }
     match range.as_deref().and_then(|value| parse_range(value, local.length)) {
         // Unsatisfiable: the spec wants `416` plus the size so the client can retry.
         Some(None) => {
@@ -1431,21 +1478,21 @@ fn reply_local_file(request: Request, local: LocalFile) {
                 format!("bytes {start}-{end}/{}", local.length).as_bytes(),
             )
             .unwrap();
-            let _ = request.respond(headers(
+            let _ = request.respond(cache_headers(headers(
                 Response::from_data(body)
                     .with_status_code(206)
                     .with_header(content_header(local.mime))
                     .with_header(content_range)
                     .with_header(cors_header()),
-            ));
+            )));
         }
         None => match std::fs::read(&local.path) {
             Ok(body) => {
-                let _ = request.respond(headers(
+                let _ = request.respond(cache_headers(headers(
                     Response::from_data(body)
                         .with_header(content_header(local.mime))
                         .with_header(cors_header()),
-                ));
+                )));
             }
             Err(_) => {
                 let _ = request.respond(Response::empty(500));
