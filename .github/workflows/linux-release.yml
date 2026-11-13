@@ -70,7 +70,9 @@ jobs:
         id: collect
         run: |
           mkdir -p out
-          src=$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' | head -n 1)
+          # Build chạy trong `linux/`, nên thư mục target nằm ở
+          # `linux/src-tauri/target/` — tìm từ root cho khỏi đoán.
+          src=$(find . -name '*.AppImage' -not -path './.git/*' | head -n 1)
           test -n "$src" || { echo 'không tìm thấy AppImage sau build' >&2; exit 1; }
           name="Olaz-${GITHUB_REF_NAME}-amd64.AppImage"
           cp "$src" "out/$name"
