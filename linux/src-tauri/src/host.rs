@@ -1699,6 +1699,63 @@ pub fn userdata_dir() -> PathBuf {
     base.join("olaz")
 }
 
+/// Self-install the desktop entry and icons so the window manager can match
+/// the running window (`app_id`/`WM_CLASS` = `olaz-linux`, which the bundled
+/// `Olaz.desktop` already declares via `StartupWMClass`). Without this,
+/// launching the AppImage directly leaves the window unowned: no icon in the
+/// dock and flaky minimize. Only runs from an AppImage (`$APPIMAGE` set); the
+/// icon files come from the mounted image's own `usr/share/icons`. Idempotent.
+pub fn install_desktop_entry() {
+    let Ok(appimage) = std::env::var("APPIMAGE") else { return };
+    let Some(exe) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|bin| bin.to_path_buf()))
+    else {
+        return;
+    };
+    let Some(share) = exe.parent().map(|usr| usr.join("share")) else { return };
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".local/share"));
+
+    let sizes = ["512x512", "256x256@2x", "256x256", "128x128@2x", "128x128", "32x32"];
+    let mut icon_installed = false;
+    for size in sizes {
+        let source = share.join(format!("icons/hicolor/{size}/apps/olaz-linux.png"));
+        if !source.is_file() {
+            continue;
+        }
+        let target = data.join(format!("icons/hicolor/{size}/apps/olaz-linux.png"));
+        if target.is_file() && std::fs::read(&source).is_ok_and(|bytes| std::fs::read(&target).is_ok_and(|cur| cur == bytes)) {
+            icon_installed = true;
+            continue;
+        }
+        if std::fs::create_dir_all(target.parent().unwrap()).is_ok()
+            && std::fs::copy(&source, &target).is_ok()
+        {
+            icon_installed = true;
+        }
+    }
+    if !icon_installed {
+        eprintln!("[olaz] desktop integration: không copy được icon");
+        return;
+    }
+
+    let entry = data.join("applications/olaz-linux.desktop");
+    let desktop = format!(
+        "[Desktop Entry]\nCategories=Network;\nComment=Client Zalo cho Linux\nExec=\"{}\"\n\
+         StartupWMClass=olaz-linux\nIcon=olaz-linux\nName=Olaz\nTerminal=false\nType=Application\n\
+         StartupNotify=true\nX-GNOME-UsesNotifications=true\n",
+        appimage
+    );
+    let changed = std::fs::read_to_string(&entry).map(|cur| cur != desktop).unwrap_or(true);
+    if changed {
+        if let Err(error) = std::fs::create_dir_all(entry.parent().unwrap()).and_then(|_| std::fs::write(&entry, desktop)) {
+            eprintln!("[olaz] desktop integration: không ghi được {}: {error}", entry.display());
+            return;
+        }
+        eprintln!("[olaz] desktop integration: đã cài {} (Exec={})", entry.display(), appimage);
+    }
+}
+
 fn home_dir() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
