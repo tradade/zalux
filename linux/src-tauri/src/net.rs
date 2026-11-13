@@ -74,6 +74,16 @@ pub fn perform_http(ctx: &AppContext, body: &Value) -> Value {
     }
 
     let timeout = body.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
+    // The message-sync segments (`transfersync.zaloapp.com/api/transfer-sync-v2/download`)
+    // are tens of megabytes each and arrive over whatever link the PC has. The
+    // worker budgets them like an API call (5 s), which on a normal Wi-Fi link
+    // aborts mid-download and surfaces as a sync-wide `NO_NETWORK` (1106). Give
+    // this one host a real download budget; the request itself is unchanged.
+    let timeout = if url.contains("transfersync.") {
+        timeout.max(120_000)
+    } else {
+        timeout
+    };
     let payload = match body.get("body") {
         Some(encoded) => match apply_body(encoded) {
             Ok(bytes) => bytes,

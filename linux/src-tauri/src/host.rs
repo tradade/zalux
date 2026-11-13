@@ -441,25 +441,42 @@ fn patch_sync_asset(path: &str, data: Vec<u8>) -> Vec<u8> {
     if is_js { patch_worker_pool_timeout(data) } else { data }
 }
 
-/// The sync-v2 worker pool settles a task as `TIMEOUT` after 10 s
-/// (`` `Task ${id} timed out after 10000 ms` ``) and drops it, which surfaces as
-/// `insertToDb` failing and the transfer ending in `MSG_IMPORT_FAILED` (1037).
-/// That budget is tuned for Zalo's SQLite path; on Linux every write goes through
-/// WebKitGTK's IndexedDB, which is far slower for the 2000-message import batches,
-/// so batches that are still writing get killed. Give the pool a budget that fits
-/// the storage path — the task itself is unchanged, only how long it may take.
+/// The sync-v2 worker pool settles a task as `TIMEOUT` and drops it, which
+/// surfaces as `insertToDb` failing and the transfer ending in
+/// `MSG_IMPORT_FAILED` (1037). Two bundle shapes carry that budget:
+///
+/// * an older shape sized it from a constructor parameter
+///   (`this.taskTimeout=i,…`), patched to at least 120 s;
+/// * the current shape hardcodes `WorkerTimeOut:6e4` (60 s) next to the
+///   message-channel table — raised to 10 minutes. WebKitGTK's IndexedDB is
+///   far slower than Zalo's SQLite for the 2000-message import batches, so
+///   batches that are still writing get killed. The task itself is unchanged,
+///   only how long it may take.
 fn patch_worker_pool_timeout(data: Vec<u8>) -> Vec<u8> {
-    const NEEDLE: &[u8] = b"this.taskTimeout=i,this.workers=[]";
-    const REPLACEMENT: &[u8] = b"this.taskTimeout=Math.max(i,1.2e5),this.workers=[]";
-    let Some(pos) = find_bytes(&data, NEEDLE) else { return data };
-    if find_bytes(&data[pos + NEEDLE.len()..], NEEDLE).is_some() {
-        return data;
+    const OLD_NEEDLE: &[u8] = b"this.taskTimeout=i,this.workers=[]";
+    const OLD_REPLACEMENT: &[u8] = b"this.taskTimeout=Math.max(i,1.2e5),this.workers=[]";
+    let data = match find_bytes(&data, OLD_NEEDLE) {
+        Some(pos) if find_bytes(&data[pos + OLD_NEEDLE.len()..], OLD_NEEDLE).is_none() => {
+            let mut out = Vec::with_capacity(data.len() + OLD_REPLACEMENT.len() - OLD_NEEDLE.len());
+            out.extend_from_slice(&data[..pos]);
+            out.extend_from_slice(OLD_REPLACEMENT);
+            out.extend_from_slice(&data[pos + OLD_NEEDLE.len()..]);
+            out
+        }
+        _ => data,
+    };
+    const NEEDLE: &[u8] = b"WorkerTimeOut:6e4";
+    const REPLACEMENT: &[u8] = b"WorkerTimeOut:6e5";
+    match find_bytes(&data, NEEDLE) {
+        Some(pos) if find_bytes(&data[pos + NEEDLE.len()..], NEEDLE).is_none() => {
+            let mut out = Vec::with_capacity(data.len() + REPLACEMENT.len() - NEEDLE.len());
+            out.extend_from_slice(&data[..pos]);
+            out.extend_from_slice(REPLACEMENT);
+            out.extend_from_slice(&data[pos + NEEDLE.len()..]);
+            out
+        }
+        _ => data,
     }
-    let mut out = Vec::with_capacity(data.len() + REPLACEMENT.len() - NEEDLE.len());
-    out.extend_from_slice(&data[..pos]);
-    out.extend_from_slice(REPLACEMENT);
-    out.extend_from_slice(&data[pos + NEEDLE.len()..]);
-    out
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
