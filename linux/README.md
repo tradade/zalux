@@ -140,6 +140,8 @@ mở nên không có việc đổi fingerprint giữa phiên.
 | `OLAZ_FINGERPRINT=0` | không dùng fingerprint helper (mọi request đi bằng rustls) |
 | `OLAZ_FINGERPRINT_HELPER` | đường dẫn helper, nếu nó không nằm cạnh binary |
 | `OLAZ_DUMP=1` | in 3000 ký tự đầu body của các endpoint `/api/login/*` và `qr-id.*` (xem server trả gì khi QR bị từ chối) |
+| `OLAZ_CALL_HELPER` | binary helper gọi (`ZaloCall`) ngoài virtual helper; `virtual` (mặc định) / `none` / đường dẫn |
+| `OLAZ_REPLACE_INSTANCE=1` | bỏ qua dialog single-instance, tự đóng phiên cũ và mở mới |
 
 `--serve-only` chạy mỗi loopback bridge, không mở cửa sổ (dùng để kiểm thử):
 
@@ -217,13 +219,21 @@ APPIMAGE_EXTRACT_AND_RUN=1 OLAZ_ASAR=/path/app.asar linux/dist/Olaz_1.0.0_amd64.
 * origin ổn định: bridge bind cổng cố định **27182** (đổi bằng `OLAZ_PORT`) thay vì cổng ngẫu nhiên.
   WebKitGTK khoá localStorage/IndexedDB theo scheme+host+**cổng**, nên cổng đổi sau mỗi lần chạy
   làm Zalo mất DB tin nhắn (IndexedDB) và cache — tin nhắn không đồng bộ lại, hội thoại cũ biến mất.
-  Khi 27182 bận, app dừng và báo rõ thay vì lặng lẽ sang cổng khác (origin khác ⇒ dữ liệu mới).
+* **single-instance**: khi một phiên Olaz khác đang nghe cổng bridge, lần mở sau hiện dialog hỏi
+  *"Đóng phiên cũ & mở mới"* hoặc *Huỷ* (`instance.rs`; chỉ nhận PID là `olaz-linux` thật, không
+  bao giờ giết tiến trình lạ chiếm cổng). `OLAZ_REPLACE_INSTANCE=1` bỏ qua dialog;
+  `--serve-only` giữ hành vi cũ (fail khi cổng bận).
+* **tray icon + đóng cửa sổ chạy nền** (như Zalo PC): nhấn X chỉ ẩn cửa sổ — app vẫn chạy,
+  notification vẫn đến, icon tray (AppIndicator — GNOME cần extension AppIndicator) ở khay hệ
+  thống với menu **"Mở Olaz"** / **"Thoát"**.
 
 Chưa có (khác bản macOS):
 
 * **Giao diện**: bản macOS vẽ UI SwiftUI và ẩn DOM của renderer. Bản Linux hiển thị chính DOM đó —
   đúng như Zalo PC, nhưng chưa có giao diện native.
-* Điều khiển cửa sổ từ renderer (`minimize`, `toggle-maximize`, badge, notification) mới chỉ ack.
+* Điều khiển cửa sổ từ renderer (`minimize`, `toggle-maximize`, `focus-window`, `close-window`,
+  badge) điều khiển cửa sổ Tauri thật; notification đi qua `notify-rust` (libnotify → GNOME) và
+  click → `_noti_on-click` + focus cửa sổ.
 * `multipart/form-data` (upload ảnh/file) chưa dựng lại body; `fetch`/XHR dạng FormData sẽ lỗi.
 * `shared-worker.html` chạy trong một cửa sổ Tauri ẩn cùng origin; bridge chuyển tiếp
   `shared-worker-*` (đăng ký task, run/resp/progress/abort, remote config) giữa hai cửa sổ và
