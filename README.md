@@ -24,7 +24,8 @@ viết bằng Swift (xem [`README-macOS.md`](README-macOS.md)). Repo này là b�
 **Có thêm ở bản Linux** (bản macOS không có):
 
 - **Single-instance dialog**: mở lần 2 khi app đang chạy → hỏi "Đóng phiên cũ & mở mới / Huỷ".
-- **Tray icon + đóng cửa sổ chạy nền**: nhấn X chỉ ẩn vào khay (AppIndicator), notification vẫn đến.
+- **Tray icon + đóng cửa sổ chạy nền**: nhấn X chỉ ẩn vào khay (AppIndicator), notification vẫn đến;
+  bật/tắt **khởi động cùng hệ thống** ngay trong tray menu (file XDG autostart).
 - **Tự cập nhật bản app**: check GitHub Releases → popup → tải AppImage mới, đối chiếu SHA-256,
   tự thay file và khởi động lại, skip được từng phiên (macOS chỉ tự cập nhật runtime Zalo).
 - **Call dạng virtual helper**: không cần binary Qt — từ chối cuộc gọi đến (signal 405/12437),
@@ -293,7 +294,13 @@ APPIMAGE_EXTRACT_AND_RUN=1 OLAZ_ASAR=/path/app.asar linux/dist/Olaz_1.0.0_amd64.
   `--serve-only` giữ hành vi cũ (fail khi cổng bận).
 * **tray icon + đóng cửa sổ chạy nền** (như Zalo PC): nhấn X chỉ ẩn cửa sổ — app vẫn chạy,
   notification vẫn đến, icon tray (AppIndicator — GNOME cần extension AppIndicator) ở khay hệ
-  thống với menu **"Mở Olaz"** / **"Thoát"**.
+  thống với menu **"Mở Olaz"** / **"Khởi động cùng hệ thống"** (check-item bật/tắt autostart qua
+  file XDG `~/.config/autostart/olaz-linux.desktop`, ghi hoặc xoá; Exec trỏ `$APPIMAGE`) / **"Thoát"**.
+* **message store chuẩn format DAL**: mọi string `message` trong store được chuẩn hoá mỗi lần mở
+  (`decryptMessagesOnce` trong `olaz-linux.js`) về đúng dạng DAL lưu — XOR(UIN, JSON.stringify) —
+  idempotent; row plaintext từ sync/import trước đây làm reveal ra rác → hội thoại treo "loading"
+  với lỗi "Fail to transform data" (chữ giống base64 như "Kaka", "1930" là case sát nhất), giờ mở
+  lại render đủ bubble.
 
 Chưa có (khác bản macOS):
 
