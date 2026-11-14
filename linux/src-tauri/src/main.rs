@@ -12,6 +12,7 @@ mod host;
 mod instance;
 mod net;
 mod runtime;
+mod update;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,6 +92,12 @@ fn main() {
     // renderer in the background. Runs before the window opens, but never
     // downloads on this thread, so the window appears immediately.
     host::bootstrap_runtime(ctx.clone());
+
+    // Tự kiểm tra bản mới của app (GitHub Releases) — thread nền, popup hỏi
+    // trước khi tải. Chế độ script (--serve-only) không cần.
+    if !serve_only {
+        update::check_in_background(ctx.userdata.clone(), ctx.debug);
+    }
 
     if serve_only {
         loop {

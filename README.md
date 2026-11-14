@@ -39,8 +39,11 @@ chmod +x Olaz_*_amd64.AppImage
 cần cài gì — thư viện WebKitGTK phải có trên hệ thống (hầu hết distro desktop đã có; Ubuntu:
 `libwebkit2gtk-4.1-0`). GNOME cần extension AppIndicator để hiện icon tray khi đóng cửa sổ.
 
-**Cập nhật:** app tự cập nhật **runtime Zalo** (tải bản mới từ VNG khi có). AppImage mới theo
-release của repo này — ghé Releases để kiểm tra.
+**Cập nhật:** app **tự kiểm tra bản mới** (GitHub Releases, sau khi mở và lặp lại mỗi 12h): có bản
+mới thì hiện popup hỏi — *Cập nhật ngay* (tải AppImage mới, đối chiếu SHA-256, tự thay file và
+khởi động lại) hoặc *Bỏ qua phiên này* (không hỏi lại với phiên đó, lưu ở `<userdata>/app-update.json`).
+Bản .deb chỉ được mở trang tải về (cần root để cài). App tự cập nhật **runtime Zalo** riêng (tải
+bản mới từ VNG khi có). Tắt kiểm tra: `OLAZ_UPDATE_CHECK=0`; đổi repo check: `OLAZ_UPDATE_REPO`.
 
 ```
 Linux (Tauri / WebKitGTK)

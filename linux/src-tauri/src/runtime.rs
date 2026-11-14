@@ -424,7 +424,7 @@ pub fn version_from_installer_name(name: &str) -> Option<String> {
     Some(tail.to_string())
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file = fs::File::open(path).map_err(|e| format!("không mở được {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 4 << 20];
@@ -465,7 +465,7 @@ fn download_release(work: &Path, debug: bool) -> Result<PathBuf, String> {
     }
 }
 
-fn download(url: &str, target: &Path, debug: bool) -> Result<(), String> {
+pub(crate) fn download(url: &str, target: &Path, debug: bool) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(60 * 30))
