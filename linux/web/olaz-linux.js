@@ -45,22 +45,35 @@
   // through Rust to the Zalo origin, which is not where `/__olaz/…` lives.
   window.__olazLinux.fetch = (path, init) => nativeFetch(base + path, init);
 
-  // ------------------------------------------------- message body decryption
-  // Some sync/import paths store a message body XOR-encrypted with the session
-  // UIN (the same secret SecureLocalStorage is keyed with) instead of the JSON
-  // object the schema declares. Such a row never parses, so a photo bubble gets
-  // no `params` and stays a blurred placeholder even though the JPEG is already
-  // on disk. XOR is its own inverse, so this pass is reversible, and it only
-  // rewrites rows whose plaintext parses as JSON.
+  // ------------------------------------------------- message body normalization
+  // The official DAL stores every string `message` as XOR(UIN,
+  // JSON.stringify(value)) and re-reveals it on read; a row that instead holds
+  // wire-plaintext (sync/import) makes the DAL's reveal+JSON.parse throw
+  // "Fail to transform data" whenever the text is base64-shaped ("Kaka",
+  // "1930", …) — and that throws away the whole partition, so the conversation
+  // hangs on "loading" with only newly sent messages visible.
   // Runs on every launch (no "done" marker): a later sync/import rewrites the
   // same rows as ciphertext again, and a marker would then leave them encrypted
-  // forever. The pass itself is idempotent — only rows whose body is a string
-  // that fails JSON.parse but XOR-decodes to JSON are rewritten.
+  // forever. The pass itself is idempotent — every `message` string is brought
+  // to the official DB format, XOR(UIN, JSON.stringify(value)):
+  //   * decode XOR → parses as JSON → the row is already ciphertext-encoded
+  //     (the sync import's shape) — and when the parsed value is a string it
+  //     must STAY encoded: storing the bare string makes the DAL's
+  //     reveal+JSON.parse fail on base64-shaped texts ("Kaka", "1930", …),
+  //     which throws "Fail to transform data" and hangs that conversation.
+  //   * decode fails → the row holds wire-plaintext → encode it.
   const decryptMessagesOnce = (userId, uin) => {
     if (!userId || !uin) {
       report('decrypt: thiếu userId/UIN');
       return;
     }
+    const xorUin = (text) => {
+      let out = '';
+      for (let i = 0; i < text.length; i += 1) {
+        out += String.fromCharCode(text.charCodeAt(i) ^ uin.charCodeAt(i % uin.length));
+      }
+      return out;
+    };
     const request = indexedDB.open('zdb_' + userId);
     request.onerror = () => report('decrypt: không mở được zdb_' + userId);
     request.onsuccess = () => {
@@ -86,23 +99,22 @@
           const body = row && row.message;
           if (typeof body !== 'string' || body.length < 2) return;
           seen += 1;
+          let value = body;
           try {
-            JSON.parse(body);
-            return;
+            value = JSON.parse(xorUin(body));
           } catch (e) {}
-          let plain = '';
-          for (let i = 0; i < body.length; i += 1) {
-            plain += String.fromCharCode(body.charCodeAt(i) ^ uin.charCodeAt(i % uin.length));
-          }
-          try {
-            row.message = JSON.parse(plain);
+          // Định dạng chính thức: giá trị sau reveal; encode lại trọn vẹn nên
+          // row ciphertext giữ nguyên (idempotent) và row plaintext được sửa.
+          const target = xorUin(JSON.stringify(value));
+          if (target !== body) {
+            row.message = target;
             store.put(row);
             fixed += 1;
-          } catch (e) {}
+          }
         });
         tx.oncomplete = () => {
           db.close();
-          report('decrypt: ' + fixed + '/' + seen + ' dòng đã giải mã (' + rows.length + ' dòng trong store)');
+          report('decrypt: ' + fixed + '/' + seen + ' dòng đã chuẩn hoá (' + rows.length + ' dòng trong store)');
           // The photo warmer needs the decoded `params`: chain it here instead
           // of a fixed delay so a slow repair still feeds the cache pass.
           // A later sync/import rewrites the same rows as ciphertext again, so
