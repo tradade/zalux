@@ -702,6 +702,39 @@ mod tests {
     }
 
     #[test]
+    fn multi_file_and_mixed_parts_are_all_encoded() {
+        use base64::Engine;
+        let engine = base64::engine::general_purpose::STANDARD;
+        // Một chunk-upload thật: header text + nhiều file part trong cùng body.
+        let encoded = json!({
+            "kind": "formdata",
+            "parts": [
+                { "name": "chunkId", "value": "7" },
+                { "name": "chunkContent", "filename": "part.bin", "type": "application/octet-stream",
+                  "data": engine.encode(b"chunk-one") },
+                { "name": "chunkContent", "filename": "part.bin", "type": "application/octet-stream",
+                  "data": engine.encode(b"chunk-two") },
+                { "name": "avatar", "filename": "a.png", "type": "image/png",
+                  "data": engine.encode([0u8, 159, 146, 150]) }
+            ]
+        });
+        let (body, content_type) = apply_body(&encoded).unwrap();
+        let content_type = content_type.unwrap();
+        let boundary = content_type.rsplit('=').next().unwrap();
+        let body = body.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        // 3 file part + 1 text part, mỗi cái một khối Content-Disposition
+        assert_eq!(text.matches("Content-Disposition: form-data; name=\"chunkContent\"").count(), 2);
+        assert!(text.contains("chunk-one"));
+        assert!(text.contains("chunk-two"));
+        assert!(text.contains("filename=\"a.png\""));
+        assert!(text.contains("Content-Type: image/png"));
+        // byte nhị phân (không phải UTF-8) phải giữ nguyên qua base64
+        assert!(body.windows(4).any(|w| w == [0, 159, 146, 150]));
+        assert_eq!(text.matches(boundary).count(), 5);
+    }
+
+    #[test]
     fn frame_header_is_described_without_the_body() {
         // [version=1][cmd=0x0102 LE][sub=7] + a body that must never be printed.
         let frame = [1u8, 0x02, 0x01, 7, 0xde, 0xad, 0xbe, 0xef];
