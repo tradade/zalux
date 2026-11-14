@@ -143,6 +143,16 @@ fn main() {
             // Window-control IPC (`minimize`, `toggle-maximize`, …) and
             // notification clicks drive the real window through this handle.
             ctx.bridge.set_app_handle(app.handle().clone());
+            // Popup nội bộ (photo/video viewer): Electron mở BrowserWindow con
+            // qua window.open rồi chính renderer nạp popup-viewer.html và tự
+            // đổ dữ liệu vào (cùng origin). Tauri tái hiện bằng đường
+            // NewWindowResponse::Create — window.open trả về WindowProxy thật,
+            // mọi logic phía renderer của multi-window manager chạy như cũ.
+            let popup_app = app.handle().clone();
+            let popup_script = script.clone();
+            let popup_prefix = format!("http://127.0.0.1:{}", running.port);
+            let popup_ua = if use_custom_ua { Some(user_agent) } else { None };
+            let popup_seq = std::sync::atomic::AtomicU64::new(1);
             let mut main_window = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
@@ -156,17 +166,82 @@ fn main() {
             }
             main_window
                 .initialization_script(&script)
-                // window.open/target=_blank của renderer (link ngoài, zid store):
-                // WebKitGTK không handler "create" thì chỉ im lặng — mở bằng
-                // trình duyệt hệ thống như `NSWorkspace.shared.open` trên macOS
-                // (OfficialClientHost.decidePolicyFor).
-                .on_new_window(|url, _features| {
-                    if let Some(sanitized) = crate::bridge::external_url(url.as_str()) {
+                .on_new_window(move |url, features| {
+                    let raw = url.as_str();
+                    eprintln!("[popup] on_new_window: {raw}");
+                    if raw.starts_with(&popup_prefix) {
+                        let label = format!(
+                            "popup-{}",
+                            popup_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        );
+                        // Nhãn truyền qua URL query: popup-viewer.html tự chèn
+                        // `/__olaz/boot.js` bằng thẻ script trong trang (không
+                        // qua initialization_script của webview — related view
+                        // bỏ qua chúng), nên shim đọc nhãn từ location.search.
+                        let popup_url = if url.query().is_some() {
+                            format!("{}&__olazWin={}", raw, label)
+                        } else {
+                            format!("{}?__olazWin={}", raw, label)
+                        };
+                        let parsed: tauri::Url = match popup_url.parse() {
+                            Ok(parsed) => parsed,
+                            Err(error) => {
+                                eprintln!("[popup] URL lỗi: {error}");
+                                return tauri::webview::NewWindowResponse::Deny;
+                            }
+                        };
+                        let mut popup = tauri::WebviewWindowBuilder::new(
+                            &popup_app,
+                            label,
+                            tauri::WebviewUrl::External(parsed),
+                        )
+                        .title("Olaz viewer")
+                        .inner_size(760.0, 480.0)
+                        .initialization_script(&popup_script)
+                        .with_related_view(features.opener().webview.clone());
+                        if let Some(size) = features.size() {
+                            popup = popup.inner_size(size.width, size.height);
+                        }
+                        if let Some(pos) = features.position() {
+                            popup = popup.position(pos.x, pos.y);
+                        }
+                        if let Some(ua) = popup_ua {
+                            popup = popup.user_agent(ua);
+                        }
+                        return match popup.build() {
+                            Ok(window) => tauri::webview::NewWindowResponse::Create { window },
+                            Err(error) => {
+                                eprintln!("[popup] tạo cửa sổ lỗi: {error}");
+                                tauri::webview::NewWindowResponse::Deny
+                            }
+                        };
+                    }
+                    // Link ngoài: WebKitGTK không handler "create" thì chỉ im
+                    // lặng — mở bằng trình duyệt hệ thống như
+                    // `NSWorkspace.shared.open` trên macOS
+                    // (OfficialClientHost.decidePolicyFor).
+                    if let Some(sanitized) = crate::bridge::external_url(raw) {
                         crate::bridge::open_external(&sanitized);
                     }
                     tauri::webview::NewWindowResponse::Deny
                 })
                 .build()?;
+            // `window.open` từ script (không user gesture) mặc định bị WebKitGTK
+            // chặn — media viewer mở popup trong hiệu ứng React sau click, nên
+            // cần bật JavaScript-can-open-windows-automatically cho mọi webview.
+            use tauri::Manager as _;
+            let enable_script_windows = |window: &tauri::WebviewWindow| {
+                let _ = window.with_webview(|platform| {
+                    use webkit2gtk::{SettingsExt, WebViewExt};
+                    if let Some(settings) = platform.inner().settings() {
+                        settings.set_javascript_can_open_windows_automatically(true);
+                    }
+                });
+            };
+            enable_script_windows(app.get_webview_window("main").as_ref().unwrap());
+            if let Some(worker) = app.get_webview_window("shared-worker") {
+                enable_script_windows(&worker);
+            }
             if let Some(worker_url) = &worker_url {
                 let mut worker_window = tauri::WebviewWindowBuilder::new(
                     app,

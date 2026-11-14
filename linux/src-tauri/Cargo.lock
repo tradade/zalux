@@ -2672,6 +2672,7 @@ dependencies = [
  "tauri-build",
  "tiny_http",
  "tungstenite",
+ "webkit2gtk",
 ]
 
 [[package]]

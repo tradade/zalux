@@ -33,8 +33,13 @@
   const devEval = !!cfg.devEval;
   // Electron ran the hidden shared-worker page in its own window. Here it is a
   // second (hidden) Tauri webview on the same origin, so bridge pushes must say
-  // which of the two windows they belong to.
-  const win = /shared-worker\.html$/.test(location.pathname) ? 'shared-worker' : 'main';
+  // which of the two windows they belong to. Popup viewer windows (photo/video)
+  // carry their label via the `__olazWin` URL query (set when the host creates
+  // the window for a renderer `window.open`).
+  const win =
+    new URLSearchParams(location.search).get('__olazWin') ||
+    window.__OLAZ_LINUX_WINDOW ||
+    (/shared-worker\.html$/.test(location.pathname) ? 'shared-worker' : 'main');
   // Captured before `network-shim.js` replaces `fetch` with its proxied version:
   // bridge traffic must go straight to the loopback host, never through the
   // renderer's own proxy (that would recurse back into this handler).

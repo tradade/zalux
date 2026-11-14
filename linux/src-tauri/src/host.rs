@@ -1335,7 +1335,11 @@ return JSON.stringify({ cancelled: true, running: m2.isSyncRunning() });
                 "zlog" => {
                     let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
                     if !message.is_empty() {
-                        eprintln!("[renderer] {}", truncate(message, 2000));
+                        if window != "main" && ctx.debug {
+                            eprintln!("[renderer] [{window}] {}", truncate(message, 2000));
+                        } else {
+                            eprintln!("[renderer] {}", truncate(message, 2000));
+                        }
                     }
                     reply(request, 200, "application/json", json!({ "ok": true, "value": null }).to_string());
                 }
@@ -1540,8 +1544,15 @@ fn dev_target(value: Option<&str>) -> Result<&'static str, String> {
         // The page shim names its second window `shared-worker`; the HTTP API
         // accepts the shorter `worker` spelling and normalises it to that.
         "worker" | "shared-worker" => Ok("shared-worker"),
+        // Popup viewer windows use generated labels (popup-1, popup-2, …) —
+        // addressable by the same name the shim reports.
+        other if other.starts_with("popup-") => Ok(leak_popup_label(other)),
         other => Err(format!("target không hợp lệ: {other} (dùng main hoặc worker)")),
     }
+}
+
+fn leak_popup_label(label: &str) -> &'static str {
+    Box::leak(label.to_string().into_boxed_str())
 }
 
 fn param(query: &str, name: &str) -> Option<String> {

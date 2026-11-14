@@ -306,6 +306,18 @@ impl Bridge {
             .and_then(|app| app.get_webview_window("main"))
     }
 
+    /// Cửa sổ nhận lệnh window-control: popup viewer gửi kèm nhãn riêng
+    /// (`__OLAZ_LINUX_WINDOW` → header `x-olaz-window`); mặc định là main.
+    fn target_window(&self, asking: &str) -> Option<tauri::WebviewWindow> {
+        use tauri::Manager;
+        let app = self.app.lock().unwrap().clone()?;
+        if asking.is_empty() || asking == "main" {
+            app.get_webview_window("main")
+        } else {
+            app.get_webview_window(asking).or_else(|| app.get_webview_window("main"))
+        }
+    }
+
     /// Chạy closure trên GTK main thread và đợi kết quả. Clipboard (như mọi GDK
     /// call) phải chạy ở đó; các member bridge đến từ HTTP thread của tiny_http.
     fn on_main<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
@@ -1338,16 +1350,16 @@ impl Bridge {
         match channel {
             // Window controls from the renderer's custom titlebar: the macOS
             // host answers these in Swift (NSWindow); here they drive the
-            // Tauri window. Without them the app's own minimize/maximize
-            // buttons do nothing.
+            // Tauri window — of the window that asked (popup viewers have
+            // their own titlebar controls), not always the main one.
             "minimize" => {
-                if let Some(window) = self.main_window() {
+                if let Some(window) = self.target_window(window) {
                     let _ = window.minimize();
                 }
                 Ok(undefined())
             }
             "toggle-maximize" => {
-                if let Some(window) = self.main_window() {
+                if let Some(window) = self.target_window(window) {
                     if window.is_maximized().unwrap_or(false) {
                         let _ = window.unmaximize();
                     } else {
@@ -1357,10 +1369,12 @@ impl Bridge {
                 Ok(undefined())
             }
             "check-maximize" => Ok(json!(
-                self.main_window().and_then(|window| window.is_maximized().ok()).unwrap_or(false)
+                self.target_window(window)
+                    .and_then(|window| window.is_maximized().ok())
+                    .unwrap_or(false)
             )),
             "focus-window" => {
-                if let Some(window) = self.main_window() {
+                if let Some(window) = self.target_window(window) {
                     let _ = window.unminimize();
                     let _ = window.show();
                     let _ = window.set_focus();
@@ -1368,13 +1382,13 @@ impl Bridge {
                 Ok(undefined())
             }
             "hide-window" => {
-                if let Some(window) = self.main_window() {
+                if let Some(window) = self.target_window(window) {
                     let _ = window.hide();
                 }
                 Ok(undefined())
             }
             "close-window" => {
-                if let Some(window) = self.main_window() {
+                if let Some(window) = self.target_window(window) {
                     let _ = window.close();
                 }
                 Ok(undefined())
@@ -1389,6 +1403,28 @@ impl Bridge {
                     open_external(&sanitized);
                 }
                 Ok(undefined())
+            }
+
+            // "Lưu về máy" của media viewer / file download: Electron
+            // `dialog.showSaveDialog` → GTK save dialog, trả `{canceled, filePath}`.
+            "show-save-dialog" | "show-save-dialog-sync" => {
+                let options = args
+                    .iter()
+                    .find(|value| value.is_object())
+                    .cloned()
+                    .unwrap_or(json!({}));
+                let title = options
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Lưu về máy")
+                    .to_string();
+                let default_path = options
+                    .get("defaultPath")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let picked = save_file_dialog(&title, &default_path)?;
+                Ok(json!({ "canceled": picked.is_none(), "filePath": picked }))
             }
 
             // Desktop notifications: the notification-adapter replaces
@@ -2277,6 +2313,47 @@ fn pick_folder(title: &str, start: &str) -> Result<Option<String>, String> {
     receiver
         .recv_timeout(std::time::Duration::from_secs(600))
         .map_err(|_| "hộp thoại chọn thư mục không phản hồi".to_string())
+}
+
+/// `show-save-dialog` — GTK save dialog thay `dialog.showSaveDialog` của
+/// Electron; `defaultPath` là file đã có (media cache) thì lấy tên + thư mục.
+fn save_file_dialog(title: &str, default_path: &str) -> Result<Option<String>, String> {
+    use gtk::prelude::*;
+    use std::sync::mpsc;
+
+    let (sender, receiver) = mpsc::channel();
+    let title = title.to_string();
+    let default_path = default_path.to_string();
+    gtk::glib::MainContext::default().invoke(move || {
+        let dialog = gtk::FileChooserDialog::new(
+            if title.is_empty() { None } else { Some(title.as_str()) },
+            None::<&gtk::Window>,
+            gtk::FileChooserAction::Save,
+        );
+        dialog.add_button("Hủy", gtk::ResponseType::Cancel);
+        dialog.add_button("Lưu", gtk::ResponseType::Accept);
+        dialog.set_do_overwrite_confirmation(true);
+        let path = Path::new(&default_path);
+        if let Some(dir) = path.parent().filter(|dir| dir.is_dir()) {
+            let _ = dialog.set_current_folder(dir);
+        }
+        if path.is_file() {
+            if let Some(name) = path.file_name() {
+                dialog.set_current_name(&name.to_string_lossy());
+            }
+        }
+        let accepted = dialog.run() == gtk::ResponseType::Accept;
+        let picked = if accepted {
+            dialog.filename().map(|path| path.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        dialog.close();
+        let _ = sender.send(picked);
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(600))
+        .map_err(|_| "hộp thoại lưu không phản hồi".to_string())
 }
 
 fn file_md5(path: &Path) -> std::io::Result<String> {
