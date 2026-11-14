@@ -1200,7 +1200,7 @@
       configurable: true,
       enumerable: true,
       get: () => localModules,
-      set: (value) => { localModules = withJxl(value); },
+      set: (value) => { localModules = withClipboard(withJxl(value)); },
     });
   } catch (err) {
     report('không gắn được libjxl: ' + err);
@@ -1361,6 +1361,90 @@
   };
   // Used by the diagnostics page: `fetch` there is the proxied one.
   window.__olazLinux.post = (message) => fireAndForget('zlog', { message: String(message) });
+
+  // ------------------------------------------------------------- external links
+  // Zalo PC mở link qua `window.open` (Electron main → shell.openExternal). Trên
+  // WebKitGTK với UA Safari, `getBrowserName()` của renderer trả "Safari" và
+  // chuyển sang `openUrlInSandBox` — link nạp vào một iframe ẩn rồi bị xoá sau
+  // 5s: không có gì mở ra. Fix gốc là UA Chromium 108 (main.rs) + `window.chrome`
+  // bên dưới → renderer trả "Chrome" như trong Electron và đi đúng đường
+  // window.open; shim này đẩy URL về channel `open-external` của host
+  // (xdg-open — thay `NSWorkspace.shared.open` trên macOS).
+  // `window.chrome` như Chromium thật (Electron có sẵn) — thiếu nó
+  // `getBrowserName()` trả "" thay vì "Chrome", các nhánh Chromium không chạy.
+  if (!window.chrome) {
+    window.chrome = { app: { isInstalled: false }, runtime: {}, webstore: {} };
+  }
+  const hostOpenExternal = (url) => {
+    try {
+      nativeFetch(base + '/bridge/zbridge', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ channel: 'open-external', args: [String(url)] }),
+      });
+    } catch {}
+  };
+  const isInternalUrl = (url) =>
+    url.indexOf(base) === 0 || (base2 !== base && url.indexOf(base2) === 0);
+  const nativeOpen = window.open.bind(window);
+  window.open = (url, target, features) => {
+    if (typeof url === 'string' && /^https?:\/\//i.test(url) && !isInternalUrl(url)) {
+      hostOpenExternal(url);
+      return null;
+    }
+    return nativeOpen(url, target, features);
+  };
+
+  // --------------------------------------------------------------- copy image
+  // `$zelectronNative.writeImageToClipboard(dataUrl)` — preload Electron vẽ ảnh
+  // ra canvas, nén JPEG 0.9 rồi `clipboard.writeImage`. Ở đây phần cuối đi qua
+  // bridge (`clipboardWriteImage` → GTK clipboard) vì không có nativeImage.
+  function withClipboard(local) {
+    local['$zelectronNative.writeImageToClipboard'] = (dataUrl) => new Promise((resolve) => {
+      const fail = () => resolve(false);
+      try {
+        const img = document.createElement('img');
+        img.onload = () => {
+          try {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.naturalWidth || img.width;
+            canvas.height = img.naturalHeight || img.height;
+            if (!canvas.width || !canvas.height) return fail();
+            canvas.getContext('2d').drawImage(img, 0, 0);
+            canvas.toBlob((blob) => {
+              if (!blob) return fail();
+              const reader = new FileReader();
+              reader.onload = () => {
+                try {
+                  const result = String(reader.result || '');
+                  const base64 = result.slice(result.indexOf(',') + 1);
+                  const ok = window.__zaloBridge.callSync(
+                    '$zelectronNative.clipboardWriteImage',
+                    ['image/jpeg', base64],
+                  );
+                  resolve(ok !== false);
+                } catch (err) {
+                  report('copy ảnh: bridge lỗi — ' + err);
+                  fail();
+                }
+              };
+              reader.onerror = fail;
+              reader.readAsDataURL(blob);
+            }, 'image/jpeg', 0.9);
+          } catch (err) {
+            report('copy ảnh: canvas lỗi — ' + err);
+            fail();
+          }
+        };
+        img.onerror = fail;
+        img.src = dataUrl;
+      } catch (err) {
+        report('copy ảnh: dataUrl lỗi — ' + err);
+        fail();
+      }
+    });
+    return local;
+  }
 
   const handlers = {
     zbridge: { postMessage: (msg) => rpc('zbridge', msg) },

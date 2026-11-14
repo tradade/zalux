@@ -198,6 +198,7 @@ mở nên không có việc đổi fingerprint giữa phiên.
 | `OLAZ_DUMP=1` | in 3000 ký tự đầu body của các endpoint `/api/login/*` và `qr-id.*` (xem server trả gì khi QR bị từ chối) |
 | `OLAZ_CALL_HELPER` | binary helper gọi (`ZaloCall`) ngoài virtual helper; `virtual` (mặc định) / `none` / đường dẫn |
 | `OLAZ_REPLACE_INSTANCE=1` | bỏ qua dialog single-instance, tự đóng phiên cũ và mở mới |
+| `OLAZ_WEBVIEW_UA` | ghi đè UA webview (mặc định Chromium 108 để renderer đi đúng nhánh mở link; `default` = UA WebKitGTK gốc) |
 
 `--serve-only` chạy mỗi loopback bridge, không mở cửa sổ (dùng để kiểm thử):
 
@@ -301,6 +302,16 @@ APPIMAGE_EXTRACT_AND_RUN=1 OLAZ_ASAR=/path/app.asar linux/dist/Olaz_1.0.0_amd64.
   idempotent; row plaintext từ sync/import trước đây làm reveal ra rác → hội thoại treo "loading"
   với lỗi "Fail to transform data" (chữ giống base64 như "Kaka", "1930" là case sát nhất), giờ mở
   lại render đủ bubble.
+* **mở link ngoài bằng trình duyệt hệ thống**: webview chạy UA Chromium 108 (Electron của Zalo PC)
+  + shim `window.chrome` → `getBrowserName()` của renderer trả "Chrome" (UA WebKit/Safari khiến nó
+  nạp link vào iframe ẩn `openUrlInSandBox` rồi xoá đi — không có gì mở ra); `window.open` và
+  `on_new_window` của Tauri đẩy URL về channel `open-external` → `xdg-open`, đúng kiểu
+  `NSWorkspace.shared.open` trong `OfficialClientHost.decidePolicyFor` bên macOS. Đổi/quay lại UA
+  webview bằng `OLAZ_WEBVIEW_UA` (`default` = UA WebKitGTK gốc).
+* **clipboard thật (GTK)**: `$zelectronNative.clipboardText/clipboardWriteText` đọc/ghi X11/Wayland
+  clipboard qua GDK (chạy trên main thread, thay `NSPasteboard` bên macOS) — nút "Sao chép" của
+  chat hoạt động; `writeImageToClipboard` (dataURL → canvas → JPEG → `clipboardWriteImage`) copy
+  được ảnh vào clipboard.
 
 Chưa có (khác bản macOS):
 

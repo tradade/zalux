@@ -111,6 +111,19 @@ fn main() {
     // ready. Going straight to `login.html` left a first paint with no status
     // at all — and no way back when the renderer itself stalled.
     let url = format!("http://127.0.0.1:{}/__olaz/index.html", running.port);
+    // UA Chromium 108 — Electron 22.3.9 của Zalo PC. `getBrowserName()` của
+    // renderer dùng UA để chọn đường mở link: UA Safari/WebKit khiến nó nạp
+    // link vào iframe ẩn (openUrlInSandBox) rồi xoá đi — không có gì mở ra. Với
+    // "Chrome" trong UA (cùng `window.chrome` shim ở olaz-linux.js) renderer
+    // đi đúng đường window.open như bên Electron.
+    // CHÚ Ý: đổi UA của webview làm Zalo yêu cầu đăng nhập lại (session gắn
+    // môi trường trang) — nếu khôi phục session cũ, có thể tạm hạ về UA mặc
+    // định của WebKitGTK.
+    let user_agent: &'static str = match std::env::var("OLAZ_WEBVIEW_UA") {
+        Ok(value) if !value.is_empty() => Box::leak(value.into_boxed_str()),
+        _ => "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+    };
+    let use_custom_ua = std::env::var("OLAZ_WEBVIEW_UA") != Ok("default".to_string());
     // Electron created a hidden `shared-worker.html` window next to the main one;
     // it runs the start-up cloud scan/offline-sync tasks and owns the
     // SecureLocalStorage that needs the viewer key. Without it the renderer's
@@ -130,23 +143,43 @@ fn main() {
             // Window-control IPC (`minimize`, `toggle-maximize`, …) and
             // notification clicks drive the real window through this handle.
             ctx.bridge.set_app_handle(app.handle().clone());
-            tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::External(url.parse()?))
-                .title("Olaz")
-                .inner_size(1100.0, 720.0)
-                .min_inner_size(760.0, 520.0)
+            let mut main_window = tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::External(url.parse()?),
+            )
+            .title("Olaz")
+            .inner_size(1100.0, 720.0)
+            .min_inner_size(760.0, 520.0);
+            if use_custom_ua {
+                main_window = main_window.user_agent(user_agent);
+            }
+            main_window
                 .initialization_script(&script)
+                // window.open/target=_blank của renderer (link ngoài, zid store):
+                // WebKitGTK không handler "create" thì chỉ im lặng — mở bằng
+                // trình duyệt hệ thống như `NSWorkspace.shared.open` trên macOS
+                // (OfficialClientHost.decidePolicyFor).
+                .on_new_window(|url, _features| {
+                    if let Some(sanitized) = crate::bridge::external_url(url.as_str()) {
+                        crate::bridge::open_external(&sanitized);
+                    }
+                    tauri::webview::NewWindowResponse::Deny
+                })
                 .build()?;
             if let Some(worker_url) = &worker_url {
-                tauri::WebviewWindowBuilder::new(
+                let mut worker_window = tauri::WebviewWindowBuilder::new(
                     app,
                     "shared-worker",
                     tauri::WebviewUrl::External(worker_url.parse()?),
                 )
                 .title("Olaz worker")
                 .visible(false)
-                .inner_size(1.0, 1.0)
-                .initialization_script(&script)
-                .build()?;
+                .inner_size(1.0, 1.0);
+                if use_custom_ua {
+                    worker_window = worker_window.user_agent(user_agent);
+                }
+                worker_window.initialization_script(&script).build()?;
             }
             // Photos that predate the cache-stem fix get their `Cache/` variants here,
             // off the UI thread. The walk is idempotent and skips complete entries.

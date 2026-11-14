@@ -60,6 +60,7 @@ const MEMBERS: &[(&str, &str)] = &[
     ("$zelectronNative.clipboardText", "sync"),
     ("$zelectronNative.clipboardWriteText", "sync"),
     ("$zelectronNative.clipboardFormats", "sync"),
+    ("$zelectronNative.clipboardWriteImage", "sync"),
     ("$olaz.jxl.decode", "async"),
     ("$olaz.jxl.info", "async"),
     ("$olaz.photo.cache", "async"),
@@ -303,6 +304,60 @@ impl Bridge {
             .unwrap()
             .as_ref()
             .and_then(|app| app.get_webview_window("main"))
+    }
+
+    /// Chạy closure trên GTK main thread và đợi kết quả. Clipboard (như mọi GDK
+    /// call) phải chạy ở đó; các member bridge đến từ HTTP thread của tiny_http.
+    fn on_main<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let app = self.app.lock().unwrap().clone()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.run_on_main_thread(move || {
+            let _ = tx.send(f());
+        })
+        .ok()?;
+        rx.recv().ok()
+    }
+
+    /// GTK clipboard (X11/Wayland) — thay `NSPasteboard` của bản macOS
+    /// (`BridgeImplementation.swift:65`).
+    fn clipboard_read_text(&self) -> String {
+        self.on_main(|| {
+            gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD)
+                .wait_for_text()
+                .map(|text| text.to_string())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+    }
+
+    fn clipboard_write_text(&self, text: &str) {
+        self.on_main({
+            let text = text.to_string();
+            move || {
+                gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD).set_text(&text);
+            }
+        });
+    }
+
+    /// Ảnh vào clipboard qua gdk-pixbuf (PNG/JPEG tự nhận bởi loader).
+    fn clipboard_write_image(&self, bytes: &[u8]) -> bool {
+        let bytes = bytes.to_vec();
+        self.on_main(move || {
+            use gtk::prelude::PixbufLoaderExt;
+            let loader = gtk::gdk_pixbuf::PixbufLoader::new();
+            if loader.write(&bytes).is_err() {
+                return false;
+            }
+            let _ = loader.close();
+            match loader.pixbuf() {
+                Some(pixbuf) => {
+                    gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD).set_image(&pixbuf);
+                    true
+                }
+                None => false,
+            }
+        })
+        .unwrap_or(false)
     }
 
     pub fn set_base_url(&self, base: String) {
@@ -574,9 +629,27 @@ impl Bridge {
                 Ok(undefined())
             }
             "$zelectron.clearCookie" => Ok(undefined()),
-            "$zelectronNative.clipboardText" => Ok(Value::String(String::new())),
-            "$zelectronNative.clipboardWriteText" => Ok(undefined()),
-            "$zelectronNative.clipboardFormats" => Ok(json!([])),
+            // Clipboard thật (GTK) thay vì trả rỗng — copy text/ảnh trong chat
+            // của renderer đi qua `$zelectronNative.*` (Electron `clipboard`).
+            "$zelectronNative.clipboardText" => Ok(Value::String(self.clipboard_read_text())),
+            "$zelectronNative.clipboardWriteText" => {
+                self.clipboard_write_text(&str_arg(args, 0).unwrap_or_default());
+                Ok(undefined())
+            }
+            "$zelectronNative.clipboardFormats" => Ok(json!(if self.clipboard_read_text().is_empty() {
+                Vec::<String>::new()
+            } else {
+                vec!["text/plain".to_string()]
+            })),
+            // args = [mime, base64] — ảnh canvas đã nén từ `olaz-linux.js`.
+            "$zelectronNative.clipboardWriteImage" => {
+                let data = str_arg(args, 1).unwrap_or_default();
+                let decoded = base64::engine::general_purpose::STANDARD.decode(data.as_bytes());
+                Ok(json!(match decoded {
+                    Ok(bytes) => self.clipboard_write_image(&bytes),
+                    Err(_) => false,
+                }))
+            }
             "$zFileManager.getSentryConfig" => Ok(Value::Null),
             // Main answered the write with nothing; `null` would look like a value.
             "$zFileManager.saveSentryConfig" => Ok(undefined()),
@@ -1303,6 +1376,17 @@ impl Bridge {
             "close-window" => {
                 if let Some(window) = self.main_window() {
                     let _ = window.close();
+                }
+                Ok(undefined())
+            }
+
+            // Link ngoài: renderer gọi window.open / openUrlInSandBox (shim
+            // `olaz-linux.js` đẩy về đây) — mở bằng trình duyệt hệ thống, đúng
+            // như `NSWorkspace.shared.open` trên macOS.
+            "open-external" => {
+                let url = str_arg(args, 0).unwrap_or_default();
+                if let Some(sanitized) = external_url(&url) {
+                    open_external(&sanitized);
                 }
                 Ok(undefined())
             }
@@ -2071,6 +2155,49 @@ fn str_arg(args: &[Value], index: usize) -> Option<String> {
         Value::Number(number) => Some(number.to_string()),
         Value::Bool(flag) => Some(flag.to_string()),
         _ => None,
+    }
+}
+
+/// Chỉ http/https được mở ra ngoài (giống lọc scheme của bản macOS trong
+/// `OfficialClientHost.decidePolicyFor`); URL khác (javascript:, file:, …) bị bỏ.
+pub fn external_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// Mở URL bằng trình duyệt hệ thống (`xdg-open` — thay `NSWorkspace.shared.open`).
+/// Thread riêng để reap tiến trình con, không khoá thread bridge.
+pub fn open_external(url: &str) {
+    match std::process::Command::new("xdg-open").arg(url).spawn() {
+        Ok(child) => {
+            std::thread::spawn(move || {
+                let mut child = child;
+                let _ = child.wait();
+            });
+        }
+        Err(error) => eprintln!("[open-external] xdg-open lỗi: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod external_link_tests {
+    use super::external_url;
+
+    #[test]
+    fn only_http_https_passes_the_external_filter() {
+        assert_eq!(
+            external_url("  https://zalo.me/blog  "),
+            Some("https://zalo.me/blog".to_string())
+        );
+        assert_eq!(external_url("http://example.com"), Some("http://example.com".to_string()));
+        assert_eq!(external_url("javascript:alert(1)"), None);
+        assert_eq!(external_url("file:///etc/passwd"), None);
+        assert_eq!(external_url("data:text/html,x"), None);
+        assert_eq!(external_url(""), None);
     }
 }
 
