@@ -9,6 +9,7 @@ mod call;
 mod download;
 mod fingerprint;
 mod host;
+mod instance;
 mod net;
 mod runtime;
 
@@ -40,6 +41,22 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // Single-instance: một instance khác đang nghe cổng bridge (cùng origin,
+    // không thể chạy song song) → hỏi người dùng đóng phiên cũ hay huỷ.
+    // `--serve-only` là chế độ script, giữ hành vi cũ (fail khi cổng bận).
+    if !serve_only {
+        if let Some(old_pid) = instance::detect(instance::bridge_port()) {
+            if !instance::ask_replace(old_pid) {
+                eprintln!("[olaz] người dùng huỷ — một phiên Olaz khác vẫn đang chạy.");
+                return;
+            }
+            if !instance::terminate(old_pid) {
+                eprintln!("olaz-linux: không đóng được phiên cũ (PID {old_pid}) — cổng vẫn bận.");
+                std::process::exit(2);
+            }
+            eprintln!("[olaz] đã đóng phiên cũ (PID {old_pid}) — mở phiên mới.");
+        }
+    }
     let running = match host::start(ctx.clone()) {
         Ok(running) => running,
         Err(error) => {
