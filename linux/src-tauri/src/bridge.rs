@@ -1413,16 +1413,28 @@ impl Bridge {
                     .find(|value| value.is_object())
                     .cloned()
                     .unwrap_or(json!({}));
+                if self.debug {
+                    let args_text = json!(args).to_string();
+                    let brief: String = args_text.chars().take(400).collect();
+                    eprintln!("[save-dialog] args: {brief}");
+                }
                 let title = options
                     .get("title")
                     .and_then(Value::as_str)
                     .unwrap_or("Lưu về máy")
                     .to_string();
-                let default_path = options
+                let mut default_path = options
                     .get("defaultPath")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                if default_path.is_empty() {
+                    // Renderer không mang fileName/url (media item của viewer
+                    // khác bên Electron) — gợi ý bằng file lần tải gần nhất.
+                    if let Some(path) = crate::download::last_saved_path() {
+                        default_path = path;
+                    }
+                }
                 let picked = save_file_dialog(&title, &default_path)?;
                 Ok(json!({ "canceled": picked.is_none(), "filePath": picked }))
             }
@@ -2333,13 +2345,16 @@ fn save_file_dialog(title: &str, default_path: &str) -> Result<Option<String>, S
         dialog.add_button("Hủy", gtk::ResponseType::Cancel);
         dialog.add_button("Lưu", gtk::ResponseType::Accept);
         dialog.set_do_overwrite_confirmation(true);
+        // `defaultPath` là đường dẫn ĐỀ XUẤT (thường chưa tồn tại trên đĩa) —
+        // luôn lấy tên file và thư mục cha từ nó, không kiểm tra is_file.
         let path = Path::new(&default_path);
         if let Some(dir) = path.parent().filter(|dir| dir.is_dir()) {
             let _ = dialog.set_current_folder(dir);
         }
-        if path.is_file() {
-            if let Some(name) = path.file_name() {
-                dialog.set_current_name(&name.to_string_lossy());
+        if let Some(name) = path.file_name() {
+            let name = name.to_string_lossy();
+            if !name.is_empty() {
+                dialog.set_current_name(&name);
             }
         }
         let accepted = dialog.run() == gtk::ResponseType::Accept;

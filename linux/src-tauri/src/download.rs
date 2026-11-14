@@ -128,9 +128,12 @@ fn start(
                 map.remove(&id);
             }
         }
+        if let Some(path) = &outcome.save_path {
+            *last_saved().lock().unwrap() = Some(path.clone());
+        }
         let data = json!({
             "downloadError": outcome.failure.unwrap_or(Value::Null),
-            "savePath": outcome.save_path.map(Value::String).unwrap_or(Value::Null),
+            "savePath": outcome.save_path.clone().map(Value::String).unwrap_or(Value::Null),
             "downloadFrom": from,
             "key": key,
             "type": kind,
@@ -142,6 +145,19 @@ fn start(
             "args": [{ "channel": "new-download-file-resp", "data": data }],
         }));
     });
+}
+
+/// Đường dẫn file lần tải gần nhất (media cache) — `show-save-dialog` dùng
+/// làm tên gợi ý khi renderer gửi `defaultPath` rỗng (media item của viewer
+/// không mang fileName/url như bên Electron).
+fn last_saved() -> &'static std::sync::Mutex<Option<String>> {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+    LAST.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Path lần tải gần nhất (nếu có).
+pub fn last_saved_path() -> Option<String> {
+    last_saved().lock().unwrap().clone()
 }
 
 /// JPEG XL codestream (`FF 0A`) or container (`....JXL ` box).
