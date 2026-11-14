@@ -150,7 +150,45 @@ fn main() {
             if ctx.dev_eval_enabled() {
                 host::start_dev_harness(ctx.clone());
             }
+            // Tray icon (khay hệ thống / AppIndicator — GNOME cần extension
+            // AppIndicator, máy này có sẵn): đóng cửa sổ thì app vẫn chạy nền
+            // với icon; menu "Mở Olaz" mở lại, "Thoát" kết thúc hẳn.
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::TrayIconBuilder;
+            use tauri::Manager;
+            let open_item = MenuItem::with_id(app, "tray-open", "Mở Olaz", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "tray-quit", "Thoát", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&open_item, &quit_item])?;
+            let mut tray = TrayIconBuilder::with_id("olaz-tray")
+                .menu(&tray_menu)
+                .tooltip("Olaz")
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "tray-open" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.unminimize();
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "tray-quit" => app.exit(0),
+                    _ => {}
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            tray.build(app)?;
             Ok(())
+        })
+        // Đóng cửa sổ (X của titlebar renderer hoặc `close-window` IPC) chỉ
+        // ẩn — app chạy nền với icon tray như Zalo PC. Thoát hẳn qua menu tray.
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .run(tauri::generate_context!())
         .expect("olaz-linux: Tauri không khởi động được");
