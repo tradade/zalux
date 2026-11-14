@@ -1,0 +1,923 @@
+//! zcall-v2: cầu nối giữa renderer và trình gọi native (`ZaloCall`).
+//!
+//! Port Rust của `CallBridge.swift` + `CallTransport.swift` (bản macOS):
+//!
+//!   renderer ──`call-send-to-native` / `call-init`──▶ Bridge ──mã hoá, cắt khúc──▶ socket send ──▶ helper
+//!   renderer ◀──`call-update` / `call-send-signal` / `call-request` / `call-response-*`── socket recv ◀── helper
+//!
+//! Định dạng frame hai chiều: `hex(AES-128-CBC(json))` kết thúc bằng `$`
+//! (payload > 4000 ký tự phía main → helper được cắt thành
+//! `<khúc>#<seq>#<số khúc>#<chỉ số>#$`, một khúc trên wire, helper xác nhận
+//! mỗi khúc bằng cách ghi lại bất kỳ dữ liệu gì). Trên Linux helper là binary
+//! ngoài được trỏ bằng `OLAZ_CALL_HELPER` — không đặt thì mọi thứ vẫn chạy
+//! graceful (tín hiệu được xếp hàng, chỉ có log).
+//!
+//! Nội dung message là JSON chứa token/id: chỉ log tên lệnh (chính sách chung).
+
+use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::process::{Child, Command as ProcessCommand};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use base64::Engine;
+use serde_json::{json, Value};
+
+use crate::host::Events;
+
+/// `callV2TransportAesKey` (base64 của khoá AES 16 byte) — hằng số của client
+/// chính thức (module "5NUA"), xem `CallTransport.swift`.
+const KEY_BASE64: &str = "yjAF9oqMWl6XfXYJn9mA7w==";
+const CHUNK_SIZE: usize = 4000;
+const MAX_PENDING: usize = 500;
+const MAX_FRAME_BUFFER: usize = 4_000_000;
+
+/// Khoá transport giải mã một lần rồi cache (`transport_key()` cũ decode
+/// base64 ở mọi frame — lãng phí vì khoá là hằng số của client).
+fn transport_key() -> &'static [u8] {
+    static KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        base64::engine::general_purpose::STANDARD
+            .decode(KEY_BASE64)
+            .unwrap_or_default()
+    })
+}
+
+fn zero_iv() -> [u8; 16] {
+    [0u8; 16]
+}
+
+fn encrypt_frame(text: &str) -> Option<String> {
+    let cipher = crate::bridge::cbc_run(true, transport_key(), &zero_iv(), text.as_bytes()).ok()?;
+    Some(hex_encode(&cipher))
+}
+
+fn decrypt_frame(frame: &str) -> Option<Value> {
+    let bytes = hex_decode(frame)?;
+    if bytes.is_empty() || bytes.len() % 16 != 0 {
+        return None;
+    }
+    let plain = crate::bridge::cbc_run(false, transport_key(), &zero_iv(), &bytes).ok()?;
+    // `decrypt → strip NUL → JSON.parse` (CallFrameDecoder.parse).
+    let cleaned: Vec<u8> = plain.into_iter().filter(|&byte| byte != 0).collect();
+    serde_json::from_slice(&cleaned).ok()
+}
+
+const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX_CHARS[(byte >> 4) as usize] as char);
+        out.push(HEX_CHARS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    let chars = hex.trim().as_bytes();
+    if chars.len() % 2 != 0 {
+        return None;
+    }
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    chars
+        .chunks(2)
+        .map(|pair| Some(nibble(pair[0])? << 4 | nibble(pair[1])?))
+        .collect()
+}
+
+/// `CallChunker`: `r` bắt đầu từ 1 và mỗi message là `max(r + 1, Date.now())`.
+#[derive(Default)]
+struct Chunker {
+    sequence: u64,
+}
+
+impl Chunker {
+    fn chunks(&mut self, payload: &str) -> Vec<String> {
+        let count = payload.len().div_ceil(CHUNK_SIZE);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        self.sequence = (self.sequence + 1).max(now);
+        if count <= 1 {
+            return vec![format!("{payload}$")];
+        }
+        // `payload` là hex thường (ASCII): offset byte = offset ký tự.
+        (0..count)
+            .map(|index| {
+                let start = index * CHUNK_SIZE;
+                let end = payload.len().min(start + CHUNK_SIZE);
+                format!("{}#{}#{}#{}#$", &payload[start..end], self.sequence, count, index)
+            })
+            .collect()
+    }
+}
+
+/// Gom luồng byte helper → main theo `$`; frame chưa đủ chờ phần còn lại.
+struct FrameDecoder {
+    buffer: Vec<u8>,
+}
+
+impl FrameDecoder {
+    fn new() -> Self {
+        Self { buffer: Vec::new() }
+    }
+
+    /// Trả về `(message hoàn chỉnh, số frame bỏ)`.
+    fn feed(&mut self, data: &[u8]) -> (Vec<Value>, usize) {
+        self.buffer.extend_from_slice(data);
+        let mut messages = Vec::new();
+        let mut dropped = 0;
+        while let Some(end) = self.buffer.iter().position(|&byte| byte == b'$') {
+            let frame: Vec<u8> = self.buffer.drain(..=end).collect();
+            let text = String::from_utf8_lossy(&frame[..end]).trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            match decrypt_frame(&text) {
+                Some(message) => messages.push(message),
+                None => dropped += 1,
+            }
+        }
+        if self.buffer.len() > MAX_FRAME_BUFFER {
+            self.buffer.clear();
+            dropped += 1;
+        }
+        (messages, dropped)
+    }
+}
+
+fn undefined_marker() -> Value {
+    json!({ "__undefined": true })
+}
+
+enum Command {
+    SendToNative { json: String, optional: bool },
+    Init(Option<String>),
+    Reset,
+    /// Người dùng từ chối cuộc gọi đến (banner in-page, virtual mode).
+    Decline,
+    /// Kết nối mới trên socket send (bản ghi để worker ghi).
+    SendUp { conn: usize, stream: UnixStream },
+    /// Helper xác nhận một khúc (ghi lại bất kỳ dữ liệu gì).
+    SendAck { conn: usize },
+    SendDown { conn: usize },
+    RecvUp { conn: usize },
+    RecvDown { conn: usize },
+    /// Message đã giải mã từ socket recv.
+    HelperMessage(Value),
+}
+
+/// Tay cầm cho các thread khác (bridge) gửi lệnh vào worker.
+#[derive(Clone)]
+pub struct CallHandle {
+    tx: Sender<Command>,
+}
+
+impl CallHandle {
+    pub fn send_to_native(&self, json: String, optional: bool) {
+        let _ = self.tx.send(Command::SendToNative { json, optional });
+    }
+
+    pub fn init(&self, json: Option<String>) {
+        let _ = self.tx.send(Command::Init(json));
+    }
+
+    pub fn reset(&self) {
+        let _ = self.tx.send(Command::Reset);
+    }
+
+    pub fn decline(&self) {
+        let _ = self.tx.send(Command::Decline);
+    }
+}
+
+struct State {
+    generation: u64,
+    /// Chế độ helper: `External` (binary qua `OLAZ_CALL_HELPER`), `Virtual`
+    /// (mặc định — xử lý mức UI ngay trong Rust: listDevice, từ chối gọi đến).
+    mode: Mode,
+    started: bool,
+    helper: Option<Child>,
+    unavailable_logged: bool,
+    socket_dir: Option<PathBuf>,
+    socket_dir_cleaned: bool,
+    init_json: Option<String>,
+    pending: VecDeque<String>,
+    native_ready: bool,
+    flushed_for_ready: bool,
+    /// Kết nối hiện tại trên socket send: id + bản ghi để ghi.
+    send_conn: Option<(usize, UnixStream)>,
+    awaiting_ack: bool,
+    chunk_queue: VecDeque<String>,
+    chunker: Chunker,
+    restart_after_exit: bool,
+    /// `killMe`: (pid, mốc SIGTERM kế, giai đoạn) — SIGINT đã gửi trước đó.
+    escalate: Option<(u32, Instant, u8)>,
+    recv_generations: HashMap<usize, u64>,
+    send_generations: HashMap<usize, u64>,
+    // Virtual mode: danh sách thiết bị từ init data + cuộc gọi đến đang reo.
+    virtual_devices: Option<Value>,
+    virtual_incoming: Option<Value>,
+}
+
+impl State {
+    fn new(mode: Mode) -> Self {
+        Self {
+            generation: 0,
+            mode,
+            started: false,
+            helper: None,
+            unavailable_logged: false,
+            socket_dir: None,
+            socket_dir_cleaned: false,
+            init_json: None,
+            pending: VecDeque::new(),
+            native_ready: false,
+            flushed_for_ready: false,
+            send_conn: None,
+            awaiting_ack: false,
+            chunk_queue: VecDeque::new(),
+            chunker: Chunker::default(),
+            restart_after_exit: false,
+            escalate: None,
+            recv_generations: HashMap::new(),
+            send_generations: HashMap::new(),
+            virtual_devices: None,
+            virtual_incoming: None,
+        }
+    }
+}
+
+/// Chế độ helper.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Binary ngoài qua `OLAZ_CALL_HELPER` (khi có helper tương thích).
+    External,
+    /// Mặc định: không có binary — xử lý mức UI ngay trong Rust
+    /// (trả lời `listDevice`, theo dõi cuộc gọi đến, từ chối).
+    Virtual,
+    /// `OLAZ_CALL_HELPER=none`: tắt hẳn.
+    Off,
+}
+
+fn helper_mode() -> Mode {
+    match std::env::var("OLAZ_CALL_HELPER") {
+        Ok(value) => match value.trim() {
+            "" | "none" | "off" => Mode::Off,
+            "virtual" => Mode::Virtual,
+            _ => Mode::External,
+        },
+        Err(_) => Mode::Virtual,
+    }
+}
+
+/// Khởi động worker + hai socket server. Trả về tay cầm gửi lệnh.
+pub fn start(events: Arc<Events>, debug: bool) -> CallHandle {
+    let (tx, rx) = mpsc::channel::<Command>();
+    let worker_tx = tx.clone();
+    let mode = helper_mode();
+    std::thread::Builder::new()
+        .name("call-bridge".into())
+        .spawn(move || worker(events, debug, mode, worker_tx, rx))
+        .expect("call: không tạo được thread");
+    CallHandle { tx }
+}
+
+fn worker(
+    events: Arc<Events>,
+    debug: bool,
+    mode: Mode,
+    tx: Sender<Command>,
+    rx: Receiver<Command>,
+) {
+    let mut state = State::new(mode);
+    match mode {
+        Mode::Virtual => log(debug, "call: helper nội bộ (virtual) — không có cửa sổ thoại, có thể từ chối cuộc gọi đến"),
+        Mode::External => log(debug, "call: helper ngoài (OLAZ_CALL_HELPER)"),
+        Mode::Off => log(debug, "call: helper bị tắt (OLAZ_CALL_HELPER=none)"),
+    }
+    loop {
+        match rx.recv_timeout(Duration::from_millis(400)) {
+            Ok(command) => handle(&mut state, &events, debug, &tx, command),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        // Helper thoát (reap zombie) + escalation sau `killMe`.
+        reap_helper(&mut state, &events, debug, &tx);
+        run_escalation(&mut state, debug);
+    }
+}
+
+fn handle(state: &mut State, events: &Events, debug: bool, tx: &Sender<Command>, command: Command) {
+    match command {
+        Command::SendToNative { json, optional } => match state.mode {
+            Mode::Virtual => virtual_message(state, events, debug, json),
+            Mode::External => {
+                if !optional {
+                    start_native(state, events, debug, tx);
+                }
+                deliver(state, debug, json);
+            }
+            Mode::Off => {}
+        },
+        Command::Init(json) => state.init_json = json,
+        Command::Reset => reset(state, debug),
+        Command::Decline => decline_incoming(state, events, debug),
+        Command::SendUp { conn, stream } => {
+            log(debug, "call: send connection");
+            state.send_generations.insert(conn, state.generation);
+            state.send_conn = Some((conn, stream));
+            // Kết nối mới bắt đầu sạch: không còn nửa khúc cho helper cũ.
+            state.awaiting_ack = false;
+            state.chunk_queue.clear();
+            flush_if_ready(state, debug);
+        }
+        Command::SendAck { conn } => {
+            let current = state.send_conn.as_ref().is_some_and(|(id, _)| *id == conn);
+            if current {
+                state.awaiting_ack = false;
+                pump(state, debug);
+            }
+        }
+        Command::SendDown { conn } => {
+            let ended = state.send_generations.remove(&conn);
+            let current = state.send_conn.as_ref().is_some_and(|(id, _)| *id == conn)
+                && ended == Some(state.generation);
+            if current {
+                log(debug, "call: send end");
+                reset_connection_state(state);
+                emit(events, "call-update", &[json!("callState"), json!({ "state": "free" })]);
+            }
+        }
+        Command::RecvUp { conn } => {
+            log(debug, "call: recv connection");
+            state.recv_generations.insert(conn, state.generation);
+        }
+        Command::RecvDown { conn } => {
+            state.recv_generations.remove(&conn);
+            log(debug, "call: recv end");
+            // Kết nối của helper cũ không nói gì về helper hiện tại; chỉ kết nối
+            // cuối cùng của helper này đi thì mới reset (như `CallBridge.swift`).
+            let still_connected = state.recv_generations.values().any(|&gen| gen == state.generation);
+            if !still_connected {
+                reset_connection_state(state);
+                emit(events, "call-update", &[json!("callState"), json!({ "state": "free" })]);
+            }
+        }
+        Command::HelperMessage(message) => route(state, events, debug, message),
+    }
+}
+
+/// `try_wait` helper: thoát thật thì phát `callState free` (+ khởi động lại khi
+/// `killMe` đã yêu cầu). `try_wait` cũng reap zombie.
+fn reap_helper(state: &mut State, events: &Events, debug: bool, tx: &Sender<Command>) {
+    let exited = state
+        .helper
+        .as_mut()
+        .and_then(|child| child.try_wait().ok())
+        .flatten();
+    if let Some(status) = exited {
+        let code = status.code().unwrap_or(-1);
+        log(debug, &format!("call: native exit {code}"));
+        state.helper = None;
+        state.started = false;
+        state.escalate = None;
+        reset_connection_state(state);
+        emit(events, "call-update", &[json!("callState"), json!({ "state": "free" })]);
+        if state.restart_after_exit {
+            state.restart_after_exit = false;
+            log(debug, "call: native restart");
+            start_native(state, events, debug, tx);
+        }
+    }
+}
+
+fn run_escalation(state: &mut State, debug: bool) {
+    let Some((pid, deadline, stage)) = state.escalate else {
+        return;
+    };
+    if Instant::now() < deadline {
+        return;
+    }
+    let still_ours = state.helper.as_ref().is_some_and(|child| child.id() == pid);
+    if !still_ours {
+        state.escalate = None;
+        return;
+    }
+    let signal = if stage == 0 { libc::SIGTERM } else { libc::SIGKILL };
+    unsafe {
+        libc::kill(pid as i32, signal);
+    }
+    log(debug, &format!("call: escalate stage {stage}"));
+    state.escalate = if stage == 0 {
+        Some((pid, Instant::now() + Duration::from_secs(2), 1))
+    } else {
+        None
+    };
+}
+
+fn emit(events: &Events, channel: &str, args: &[Value]) {
+    events.push(json!({ "kind": "send", "channel": channel, "args": args }));
+}
+
+/// `.helperUnavailable` trên macOS hiện alert; ở đây là toast trong trang
+/// (control event `kind:"js"` — cùng cơ chế với banner/picker).
+fn helper_notice(events: &Events, message: &str) {
+    let message = serde_json::to_string(&format!("Cuộc gọi: {message}")).unwrap_or_default();
+    events.push_control(
+        u64::MAX - 60,
+        "main",
+        json!({
+            "kind": "js",
+            "target": "main",
+            "code": format!("window.__olazCallUI && window.__olazCallUI.toast({message});")
+        }),
+    );
+}
+
+/// Virtual mode: xử lý message của renderer như một helper mức UI
+/// (không có socket, không có binary).
+fn virtual_message(state: &mut State, events: &Events, debug: bool, json: String) {
+    let Ok(message) = serde_json::from_str::<Value>(&json) else {
+        log(debug, "call: không parse được message từ renderer");
+        return;
+    };
+    let kind = message.get("type").and_then(Value::as_str).unwrap_or("");
+    let command = message.get("command").and_then(Value::as_str).unwrap_or("");
+    match (kind, command) {
+        // init data chứa `_getDefaultDevices()` — giữ lại để trả `listDevice`.
+        ("update", "init" | "updateLocal") => {
+            if let Some(data) = message.get("data") {
+                state.virtual_devices = Some(data.clone());
+            }
+        }
+        // Settings page hỏi danh sách thiết bị (chờ tối đa 25s nếu không trả).
+        ("request", "listDevice") => {
+            let data = state.virtual_devices.clone().unwrap_or_else(|| {
+                json!({
+                    "autoAudioInput": true,
+                    "autoAudioOutput": true,
+                    "defaultAudInputDevice": null,
+                    "defaultAudOutputDevice": null,
+                    "defaultVidDevice": null,
+                })
+            });
+            emit(events, "call-response-listDevice", &[data]);
+        }
+        ("control", _) => virtual_control(state, events, debug, message),
+        _ => {}
+    }
+}
+
+/// Control frame voip renderer relay cho helper (`isIncomingCallEvent` =
+/// `request` / `group_request`): ghi lại để banner có thể từ chối.
+fn virtual_control(state: &mut State, events: &Events, debug: bool, message: Value) {
+    let Some(control) = message.get("data").cloned() else {
+        return;
+    };
+    let act = control.get("act").and_then(Value::as_str).unwrap_or("");
+    match act {
+        "request" | "group_request" => {
+            let Some(data) = control.get("data") else {
+                return;
+            };
+            state.virtual_incoming = Some(control.clone());
+            // Helper thật cũng reo: renderer coi như đang trong cuộc gọi.
+            emit(events, "call-update", &[json!("callState"), json!({ "state": "incall" })]);
+            log(
+                debug,
+                &format!(
+                    "call: cuộc gọi đến đang reo ({}) — từ chối qua channel call-decline",
+                    if act == "group_request" { "nhóm" } else { "1-1" }
+                ),
+            );
+            let _ = data;
+        }
+        // Người gọi huỷ trước khi mình trả lời.
+        "cancel" | "group_cancel" => {
+            if state.virtual_incoming.take().is_some() {
+                emit(events, "call-update", &[json!("callState"), json!({ "state": "free" })]);
+                log(debug, "call: người gọi đã huỷ");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Từ chối cuộc gọi đến đang reo: gửi signal 405 (1-1) / 12437 (nhóm) —
+/// renderer relay lên server qua realtime (`sendCancelCall` /
+/// `sendCancelCallGroup`), đúng như helper thật làm.
+fn decline_incoming(state: &mut State, events: &Events, debug: bool) {
+    if state.mode != Mode::Virtual {
+        // Helper ngoài tự vẽ cửa sổ thoại và tự xử lý.
+        log(debug, "call: từ chối chỉ dùng với helper nội bộ");
+        return;
+    }
+    let Some(control) = state.virtual_incoming.take() else {
+        return;
+    };
+    let Some(data) = control.get("data") else {
+        return;
+    };
+    let Some(call_id) = data.get("callId").filter(|value| !value.is_null()) else {
+        log(debug, "call: không có callId trong control — bỏ qua từ chối");
+        return;
+    };
+    let to_id = first_string(data, &["uidN", "fromUid", "uid"]);
+    let call_type = data
+        .get("callType")
+        .cloned()
+        .or_else(|| data.get("type").cloned())
+        .unwrap_or(Value::Null);
+    let is_group = control.get("act").and_then(Value::as_str) == Some("group_request")
+        || to_id.starts_with('g');
+    let (code, payload) = if is_group {
+        (
+            12437,
+            json!({
+                "calleeId": to_id,
+                "callId": call_id,
+                "callType": call_type,
+                "hostCall": data.get("hostCall").cloned().unwrap_or(Value::Null),
+                "data": data.get("data").cloned().unwrap_or(Value::Null),
+                "partners": data.get("partners").cloned().unwrap_or(Value::Null),
+            }),
+        )
+    } else {
+        (
+            405,
+            json!({ "toId": to_id, "callId": call_id, "callType": call_type }),
+        )
+    };
+    emit(events, "call-send-signal", &[json!(code), payload]);
+    emit(events, "call-update", &[json!("callState"), json!({ "state": "free" })]);
+    log(debug, "call: đã từ chối cuộc gọi đến");
+}
+
+fn first_string(value: &Value, keys: &[&str]) -> String {
+    for key in keys {
+        match value.get(key) {
+            Some(Value::String(text)) if !text.is_empty() => return text.clone(),
+            Some(Value::Number(number)) => return number.to_string(),
+            _ => {}
+        }
+    }
+    String::new()
+}
+
+fn log(debug: bool, message: &str) {
+    if debug {
+        eprintln!("{message}");
+    }
+}
+
+/// `K()`: tạo socket dir, spawn helper. Không tìm thấy helper vẫn đánh dấu
+/// `started` (message được xếp hàng, không dồn log).
+fn start_native(state: &mut State, events: &Events, debug: bool, tx: &Sender<Command>) {
+    if state.started {
+        log(debug, "call: native already started");
+        return;
+    }
+    let helper_path = std::env::var_os("OLAZ_CALL_HELPER").map(PathBuf::from);
+    let executable = helper_path.filter(|path| std::fs::metadata(path).is_ok());
+    let Some(executable) = executable else {
+        // Mode::External đòi path tồn tại; tới đây nghĩa là file biến mất.
+        if !state.unavailable_logged {
+            state.unavailable_logged = true;
+            eprintln!("[call] helper không tìm thấy hoặc không đọc được — cuộc gọi sẽ không có cửa sổ thoại");
+            // Như `.helperUnavailable` trên macOS (alert): báo cho người dùng.
+            helper_notice(events, "Không tìm thấy trình gọi của Zalo — cuộc gọi sẽ không có cửa sổ thoại.");
+        }
+        state.started = true;
+        state.generation += 1;
+        let _ = prepare_sockets(state, debug, tx);
+        return;
+    };
+    if !state.socket_dir_cleaned {
+        state.socket_dir_cleaned = true;
+        remove_stale_directories();
+    }
+    state.started = true;
+    state.generation += 1;
+    if let Err(error) = prepare_sockets(state, debug, tx) {
+        state.started = false;
+        eprintln!("[call] không tạo được socket: {error}");
+        return;
+    }
+    let Some(dir) = &state.socket_dir else {
+        state.started = false;
+        return;
+    };
+    let recv_path = dir.join("recv");
+    let send_path = dir.join("send");
+    match ProcessCommand::new(&executable)
+        .arg(&recv_path)
+        .arg(&send_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            state.helper = Some(child);
+            state.unavailable_logged = false;
+            log(debug, "call: native started");
+        }
+        Err(error) => {
+            state.started = false;
+            eprintln!("[call] không khởi động được trình gọi: {error}");
+            helper_notice(events, "Không khởi động được trình gọi của Zalo.");
+        }
+    }
+}
+
+fn reset(state: &mut State, debug: bool) {
+    state.restart_after_exit = false;
+    state.init_json = None;
+    state.pending.clear();
+    state.virtual_devices = None;
+    state.virtual_incoming = None;
+    state.generation += 1;
+    if let Some(mut child) = state.helper.take() {
+        state.started = false;
+        let _ = child.kill();
+    }
+    reset_connection_state(state);
+    log(debug, "call: reset");
+}
+
+fn reset_connection_state(state: &mut State) {
+    state.send_conn = None;
+    state.native_ready = false;
+    state.flushed_for_ready = false;
+    state.awaiting_ack = false;
+    state.chunk_queue.clear();
+}
+
+fn prepare_sockets(state: &mut State, debug: bool, tx: &Sender<Command>) -> Result<(), String> {
+    if state.socket_dir.is_some() {
+        return Ok(());
+    }
+    let dir = make_socket_directory()?;
+    let recv_path = dir.join("recv");
+    let send_path = dir.join("send");
+    let recv_listener = UnixListener::bind(&recv_path).map_err(|error| error.to_string())?;
+    let send_listener = UnixListener::bind(&send_path).map_err(|error| error.to_string())?;
+    set_private(&dir);
+    state.socket_dir = Some(dir);
+    log(debug, "call: sockets ready");
+
+    // socket send: chấp nhận kết nối, đưa bản ghi về worker để ghi, đọc ack.
+    {
+        let tx = tx.clone();
+        std::thread::Builder::new()
+            .name("call-send-accept".into())
+            .spawn(move || {
+                for stream in send_listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    let conn = NEXT_CONN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(write_half) = stream.try_clone() {
+                        let _ = tx.send(Command::SendUp { conn, stream: write_half });
+                    }
+                    let tx = tx.clone();
+                    std::thread::Builder::new()
+                        .name("call-send-ack".into())
+                        .spawn(move || {
+                            let mut reader = stream;
+                            let mut buffer = [0u8; 64];
+                            loop {
+                                match reader.read(&mut buffer) {
+                                    Ok(0) | Err(_) => {
+                                        let _ = tx.send(Command::SendDown { conn });
+                                        break;
+                                    }
+                                    Ok(_) => {
+                                        let _ = tx.send(Command::SendAck { conn });
+                                    }
+                                }
+                            }
+                        })
+                        .ok();
+                }
+            })
+            .ok();
+    }
+
+    // socket recv: mỗi kết nối một thread giải mã frame.
+    {
+        let tx = tx.clone();
+        std::thread::Builder::new()
+            .name("call-recv-accept".into())
+            .spawn(move || {
+                for stream in recv_listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    let conn = NEXT_CONN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = tx.send(Command::RecvUp { conn });
+                    let tx = tx.clone();
+                    std::thread::Builder::new()
+                        .name("call-recv-read".into())
+                        .spawn(move || {
+                            let mut reader = stream;
+                            let mut decoder = FrameDecoder::new();
+                            let mut buffer = [0u8; 8192];
+                            loop {
+                                match reader.read(&mut buffer) {
+                                    Ok(0) | Err(_) => {
+                                        let _ = tx.send(Command::RecvDown { conn });
+                                        break;
+                                    }
+                                    Ok(count) => {
+                                        let (messages, dropped) = decoder.feed(&buffer[..count]);
+                                        if dropped > 0 {
+                                            eprintln!("[call] cannot parse payload ×{dropped}");
+                                        }
+                                        for message in messages {
+                                            let _ = tx.send(Command::HelperMessage(message));
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                        .ok();
+                }
+            })
+            .ok();
+    }
+    Ok(())
+}
+
+/// Số kết nối tăng dần cho id socket (dùng chung hai chiều).
+static NEXT_CONN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// Thư mục 0700 duy nhất qua `mkdtemp` (`/tmp/olaz-call-<pid>-XXXXXX`).
+fn make_socket_directory() -> Result<PathBuf, String> {
+    let template = format!("/tmp/olaz-call-{}-XXXXXX\0", std::process::id());
+    let mut bytes = template.into_bytes();
+    let pointer = unsafe { libc::mkdtemp(bytes.as_mut_ptr() as *mut libc::c_char) };
+    if pointer.is_null() {
+        return Err("mkdtemp thất bại".into());
+    }
+    let end = bytes.iter().position(|&byte| byte == 0).unwrap_or(bytes.len());
+    Ok(PathBuf::from(String::from_utf8_lossy(&bytes[..end]).to_string()))
+}
+
+fn set_private(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+
+/// Thư mục socket của tiến trình Olaz đã chết (crash / force quit).
+fn remove_stale_directories() {
+    let Ok(entries) = std::fs::read_dir("/tmp") else {
+        return;
+    };
+    let prefix = "olaz-call-";
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(prefix) || !entry.path().is_dir() {
+            continue;
+        }
+        let Some(pid) = name[prefix.len()..]
+            .split('-')
+            .next()
+            .and_then(|part| part.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() || process_alive(pid) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+/// `kill(pid, 0)`: tiến trình còn sống trừ khi gặp ESRCH.
+fn process_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// `O`: trước khi helper nối vào socket send, message chờ (và đi ra khi
+/// `native-ready`, sau init data); đã nối thì gửi ngay.
+fn deliver(state: &mut State, debug: bool, json: String) {
+    if state.send_conn.is_some() {
+        transmit(state, debug, json);
+    } else {
+        state.pending.push_back(json);
+        while state.pending.len() > MAX_PENDING {
+            state.pending.pop_front();
+        }
+    }
+}
+
+/// `G(e, t)`: mã hoá, cắt khúc, xếp hàng, gửi một khúc.
+fn transmit(state: &mut State, debug: bool, json: String) {
+    let Some(hex) = encrypt_frame(&json) else {
+        log(debug, "call: encrypt failed");
+        return;
+    };
+    state.chunk_queue.extend(state.chunker.chunks(&hex));
+    pump(state, debug);
+}
+
+/// `W(e)`: mỗi lần một khúc; khúc kế đi ra khi helper ghi gì đó lại.
+fn pump(state: &mut State, debug: bool) {
+    let pending = match (&state.send_conn, state.awaiting_ack, state.chunk_queue.front()) {
+        (Some((_, stream)), false, Some(chunk)) => Some((stream, chunk.clone())),
+        _ => None,
+    };
+    if let Some((mut stream, chunk)) = pending {
+        state.chunk_queue.pop_front();
+        state.awaiting_ack = true;
+        if let Err(error) = stream.write_all(chunk.as_bytes()) {
+            log(debug, &format!("call: ghi khúc lỗi: {error}"));
+        } else {
+            let _ = stream.flush();
+        }
+    }
+}
+
+/// `native-ready`: gửi init data trước, rồi mọi thứ đang chờ.
+fn flush_if_ready(state: &mut State, debug: bool) {
+    if !state.native_ready || state.send_conn.is_none() || state.flushed_for_ready {
+        return;
+    }
+    state.flushed_for_ready = true;
+    if let Some(init) = state.init_json.take() {
+        log(debug, "call: sending init data");
+        transmit(state, debug, init);
+    }
+    let queued: Vec<String> = state.pending.drain(..).collect();
+    for json in queued {
+        transmit(state, debug, json);
+    }
+}
+
+/// `Y` / `z`: định tuyến message helper → renderer.
+fn route(state: &mut State, events: &Events, debug: bool, message: Value) {
+    let kind = message.get("type").and_then(Value::as_str).unwrap_or("");
+    // `command` là string với phần lớn message nhưng là số cho `sendSignal`
+    // (401, 402, …): truyền đi nguyên trạng.
+    let raw_command = message.get("command").cloned();
+    let command_str = raw_command.as_ref().and_then(Value::as_str);
+    let data = message.get("data").cloned().unwrap_or_else(undefined_marker);
+    let name = raw_command.clone().unwrap_or_else(undefined_marker);
+    let command_name = match &raw_command {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => number.to_string(),
+        _ => "-".into(),
+    };
+    log(debug, &format!("call: native → {kind}/{command_name}"));
+    match kind {
+        "update" => {
+            if command_str == Some("native-ready") {
+                state.native_ready = true;
+                state.flushed_for_ready = false;
+                flush_if_ready(state, debug);
+            } else {
+                emit(events, "call-update", &[name, data]);
+            }
+        }
+        "sendSignal" => emit(events, "call-send-signal", &[name, data]),
+        "request" => {
+            if command_str == Some("killMe") {
+                let Some(child) = &state.helper else { return };
+                let pid = child.id();
+                state.restart_after_exit = true;
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGINT);
+                }
+                log(debug, "call: kill native");
+                // SIGINT là lời đề lịch sự; đảm bảo helper thật sự đi (và khởi động lại).
+                state.escalate = Some((pid, Instant::now() + Duration::from_secs(3), 0));
+            } else {
+                emit(events, "call-request", &[name, data]);
+            }
+        }
+        "response" => {
+            let channel = format!(
+                "call-response-{}",
+                match &raw_command {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(other) => other.to_string(),
+                    None => "undefined".into(),
+                }
+            );
+            emit(events, &channel, &[data]);
+        }
+        _ => {}
+    }
+}

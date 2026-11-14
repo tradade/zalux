@@ -234,6 +234,8 @@ pub struct Bridge {
     /// drive the real window through it.
     app: Mutex<Option<tauri::AppHandle>>,
     noti_seq: AtomicU64,
+    /// zcall-v2: cầu nối với trình gọi native (helper) — xem `call.rs`.
+    call: crate::call::CallHandle,
 }
 
 impl Bridge {
@@ -259,6 +261,7 @@ impl Bridge {
                 jar.add_cookie_str(cookie, &parsed);
             }
         }
+        let call = crate::call::start(events.clone(), debug);
         Self {
             userdata,
             client_version: Mutex::new(client_version),
@@ -278,6 +281,7 @@ impl Bridge {
             worker: Mutex::new(WorkerState::default()),
             app: Mutex::new(None),
             noti_seq: AtomicU64::new(1),
+            call,
         }
     }
 
@@ -285,6 +289,11 @@ impl Bridge {
     /// notification clicks act through this handle.
     pub fn set_app_handle(&self, app: tauri::AppHandle) {
         *self.app.lock().unwrap() = Some(app);
+    }
+
+    /// Bản sao handle ứng dụng (focus cửa sổ khi click notification gọi đến).
+    pub fn app_handle(&self) -> Option<tauri::AppHandle> {
+        self.app.lock().unwrap().clone()
     }
 
     fn main_window(&self) -> Option<tauri::WebviewWindow> {
@@ -1482,7 +1491,13 @@ impl Bridge {
             }
             "new-session" => {
                 let session = args.first().cloned().unwrap_or(Value::Null);
+                let previous = self.session.lock().unwrap().clone();
                 *self.session.lock().unwrap() = Some(session.clone());
+                // Đổi tài khoản: helper của tài khoản cũ phải dừng và quên hết
+                // (`CallBridge.reset()` trên macOS).
+                if previous != Some(session.clone()) {
+                    self.call.reset();
+                }
                 // Electron's main broadcast the session back after `authenticate`;
                 // the renderer's session-manager listens on this same channel and only
                 // then dispatches `Authenticating`, where SecureLocalStorage is
@@ -1719,6 +1734,27 @@ impl Bridge {
             | "set-login-size" | "close-window" | "hide-window" | "badge-count"
             | "app-started" | "get-auth-domain-ready" | "get-auth-domain" | "script-connected"
             | "script-terminated" | "open-channel-to" | "port-delivered" | "get-imei" => Ok(undefined()),
+            // zcall-v2: renderer → trình gọi native. `args` = `[json, optional]`
+            // từ shim preload (`HostScripts/call-adapter.js`): `json` là message
+            // đúng như main Electron `JSON.stringify`, `_optional` đã stripped
+            // và cờ `optional` nói riêng có khởi động helper hay không.
+            "call-send-to-native" => {
+                if let Some(json) = str_arg(args, 0) {
+                    let optional = args.get(1).and_then(Value::as_bool).unwrap_or(false);
+                    self.call.send_to_native(json, optional);
+                }
+                Ok(undefined())
+            }
+            "call-init" => {
+                self.call.init(str_arg(args, 0));
+                Ok(undefined())
+            }
+            // Banner in-page từ chối cuộc gọi đến (helper nội bộ): gửi signal
+            // 405/12437 lên server qua renderer, đúng như helper thật.
+            "call-decline" => {
+                self.call.decline();
+                Ok(undefined())
+            }
             other => {
                 let mut unhandled = self.unhandled.lock().unwrap();
                 let count = unhandled.entry(format!("ipc:{other}")).or_insert(0);
@@ -2234,7 +2270,7 @@ fn cipher_run(
     }
 }
 
-fn cbc_run(encrypt: bool, key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn cbc_run(encrypt: bool, key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     use cbc::cipher::generic_array::GenericArray;
     use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 

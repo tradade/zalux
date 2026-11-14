@@ -5,6 +5,7 @@
 
 mod asar;
 mod bridge;
+mod call;
 mod download;
 mod fingerprint;
 mod host;

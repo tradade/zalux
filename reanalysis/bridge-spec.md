@@ -995,6 +995,32 @@ Main module "3Zc2" → `ZaloRuntime/CallBridge.swift`; wire format → `CallTran
 - helper → main `type`: `update` (`native-ready` → send stored init data, then the queue; else renderer `call-update(command, data)`), `sendSignal` → `call-send-signal`, `request` (`killMe` → SIGINT + restart; else `call-request`), `response` → `call-response-<command>`. Socket end / exit → `call-update('callState', {state:'free'})`.
 - Renderer → main: `call-send-to-native` (starts the helper unless `_optional`), `call-init` (stored). Gates (`enable_mac_call`, `enable_ipc_call`, `enableCall`, `enableVideoCall`) come from the renderer's own config/server settings; nothing is overridden.
 
+### Renderer ↔ helper message protocol (RE từ `pc-dist/compact-app-pc.*.js`, module call helper ~8.32M)
+
+Helper là engine zrtc (VoIP SDK của Zalo — `zcall.node`/`ZaloCall` Qt, không đóng gói trong repo). Renderer là SignallingRelay: nó bọc mọi frame realtime voip và đưa helper; helper quyết định gửi signal nào lên server qua renderer. Message đều là JSON `{type, command?, data}` qua transport ở trên.
+
+**Renderer → helper** (`_sendToNative` / `_callMainInit`):
+
+| type | command | data | lúc nào |
+|---|---|---|---|
+| `update` | `init` / `updateLocal` | `{local:{id,avatar,name}, osInfo, mainWindowId, logPath, zrtcLogPath, dumpPath, clientVersion, language, timeoutMakeCall2ZRtp, enablePreviewDeviceOutgoing/Incall, enableUnstableConnecting, autoAudioInput, autoAudioOutput, defaultAudInputDevice, defaultAudOutputDevice, defaultVidDevice}` | sau đăng nhập / user fetched (gửi lại khi `updateLang`, `listDevice` update) |
+| `update` | `listDevice` | `_getDefaultDevices()` | sau khi refresh thiết bị (debounce 300ms) |
+| `update` | `advancedOptions` | `getAdvancedSettings(uid)` | đổi cài đặt nâng cao |
+| `update` | `updateLang` | `{language}` | đổi ngôn ngữ |
+| `control` | – | control frame nguyên trạng của server (`{act_type:'voip', act, data:{…}, ts, …}` + `inCallStatus` khi incoming) | realtime ctrl-polling → `handleControl` (drop nếu `data.ts` cũ > 60s) |
+| `request` | `listDevice` | `null` | Settings page xin danh sách thiết bị (đợi `call-response-listDevice`, timeout 25s) |
+
+**Helper → renderer** (main đẩy qua các channel):
+
+| channel | nội dung |
+|---|---|
+| `call-update` | `command` ∈ `native-ready` (riêng, không đẩy), `bubble` (sync call message: `{caller, duration, …}`), `endCall`, `listDevice` (kết quả scan), `callState` (`{state:'free'\|'incall'}` — cũng phát khi socket end/exit), `advancedOptions` |
+| `call-send-signal` | `[code, payload]` — helper xin renderer gửi lên server qua realtime: **401** `requestCall(calleeId, callId, codec, type)`, **402** `sendAnswerCall(callerId, callId, status, codec, extendData, rtcpAddress, rtpAddress, session)`, **405** `sendCancelCall(toId, callId, callType)`, **406** `sendLogEndCall(callId, partnerId, status, data, duration, role)` (retry queue riêng), **407** `sendRingRingCall(callerId, callId)`, **408** `sendAnswerACKCall(calleeId, callId)`, **409** `sendEndCall(toId, callId)`, **411/412/413/414** hold/unhold, **416** `sendRequestCall(…)`. Nhóm: **12433** `requestCallGroup(groupId, callId, typeRequest, data, partners)`, **12434/12435** `sendRequestCallGroup`/`sendAddUserRequestCallGroup`, **12436** `sendAnswerCallGroup(calleeId, callId, callType, hostCall, data, partners)`, **12437** `sendCancelCallGroup(calleeId, callId, callType, hostCall, data, partners)`, **12438** `sendEndCallGroup(…)`, **12439** `sendRingRingCallGroup(…)`, **12445** `getStateCallGroup(callId, hostCall, callType)`, **12446** `sendCallGroupFinish(…)`, **12447** `notifyCallGroup(…)`; media-state: **12006** on/off cam-mic, **12064** sharescreen, **12097/12098** ping/broadcast state, **12043/12044** join group call / xin share screen |
+| `call-request` | `uploadLog`, `uploadLogGroup`, `getAliasName` (renderer trả `{type:'response', command:'getAliasName', data:{noisedId, aliasName}}`), `addUser`/`addFriend` (mở picker), `popup` (confirm dialog) |
+| `call-response-<cmd>` | trả lời `request/listDevice` → `call-response-listDevice` với `{autoAudioInput, autoAudioOutput, defaultAudInputDevice, defaultAudOutputDevice, defaultVidDevice}` |
+
+Hệ quả cho Linux: phần signalling/UI mức này có thể mô phỏng không cần engine — **từ chối cuộc gọi đến** (405/12437 với `callId` lấy từ control frame) là đủ để máy bên kia nhận "từ chối"; **chấp nhận** (402) đòi media → cần engine zrtc (RE riêng). `linux/src-tauri/src/call.rs` có sẵn virtual helper làm đúng phần này (`OLAZ_CALL_HELPER=virtual`, mặc định).
+
 ### Group calls (participant picker) — `call-adapter.js` §5, `ZaloEngine+GroupCall.swift`, `Views/GroupCallPickerSheet.swift`
 
 Offsets are in `pc-dist/compact-app-pc.06caa1ffa528545b8f43.js`.

@@ -228,7 +228,17 @@ Chưa có (khác bản macOS):
 * `shared-worker.html` chạy trong một cửa sổ Tauri ẩn cùng origin; bridge chuyển tiếp
   `shared-worker-*` (đăng ký task, run/resp/progress/abort, remote config) giữa hai cửa sổ và
   gửi `receive-viewerkey` cho worker, giống `SharedWorkerRouter` bên macOS.
-* Không port `ZaloCall`/`ZaloCap` (thoại, chụp màn hình).
+* Call (zcall-v2): bridge `linux/src-tauri/src/call.rs` port từ `CallBridge.swift`/`CallTransport.swift`
+  (2 UNIX socket + AES-128-CBC + chunk 4000 ký tự, ack mỗi khúc) đã hoạt động; channel
+  `call-send-to-native`/`call-init` được xử lý, helper→renderer push qua `call-update`/
+  `call-send-signal`/`call-request`/`call-response-*`; gọi đến báo qua notification desktop + banner
+  trong trang, picker cuộc gọi nhóm là overlay HTML (`linux/web/call-ui.js`, thay modal GROUP_CALL mà
+  adapter nuốt). **Virtual helper (mặc định)**: không có binary thì `call.rs` đóng vai helper mức UI —
+  trả lời `listDevice` cho Settings, theo dõi cuộc gọi đến (`callState incall`) và cho phép **từ chối**
+  bằng signal 405 (1-1) / 12437 (nhóm) qua banner in-page → renderer relay lên server như helper thật.
+  **Chưa có**: chấp nhận cuộc gọi (402 đòi media — cần engine zrtc, xem protocol đã RE trong
+  `reanalysis/bridge-spec.md` §"Renderer ↔ helper message protocol"); binary helper ngoài (nếu có, trỏ
+  `OLAZ_CALL_HELPER=<đường dẫn>`; `OLAZ_CALL_HELPER=none` để tắt hẳn). `ZaloCap` (chụp màn hình) chưa port.
 * WebSocket realtime đi bằng tungstenite (xem mục fingerprint ở trên).
 * `$zFileManager` đã port theo bản macOS: `z_u.txt` (`getViewerkey` phải reject khi thiếu),
   log trong `<userData>/cal/`, `getFileArrayBuffer`/`readFileAsync`/`svcStatAsync`, đọc theo range

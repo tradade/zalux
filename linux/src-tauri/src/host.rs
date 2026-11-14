@@ -1343,6 +1343,7 @@ return JSON.stringify({ cancelled: true, running: m2.isSyncRunning() });
                     if ctx.debug {
                         eprintln!("[state] {}", truncate(&payload.to_string(), 400));
                     }
+                    handle_call_state(ctx, &payload);
                     // The notification shim reports readiness and asks for the
                     // permission the way it expects the native host to answer
                     // (macOS: UNUserNotificationCenter). Grant it immediately —
@@ -1380,6 +1381,157 @@ fn truncate(text: &str, limit: usize) -> String {
         return text.to_string();
     }
     text.chars().take(limit).collect::<String>() + "…"
+}
+
+/// Sự kiện call của `call-adapter.js` (zcall-v2, qua `zstate`): gọi đến báo qua
+/// notification desktop; picker nhóm / pickerClosed / yêu cầu mở hội thoại chạy
+/// trong trang qua control event `kind:"js"` (cùng cơ chế cấp quyền
+/// notification phía trên). `status`/`result` chỉ có ý nghĩa log debug.
+fn handle_call_state(ctx: &Arc<AppContext>, payload: &Value) {
+    let Some(call) = payload.get("call") else {
+        return;
+    };
+    let kind = call.get("kind").and_then(Value::as_str).unwrap_or("");
+    let push_js = |code: String| {
+        ctx.events.push_control(
+            u64::MAX - 50,
+            "main",
+            json!({ "kind": "js", "target": "main", "code": code }),
+        );
+    };
+    match kind {
+        "incoming" => {
+            // Bản chính thức tự từ chối khi đang bận — không reo (như guard
+            // `busy` của `ZaloEngine+CallHook`).
+            if call.get("busy").and_then(Value::as_bool).unwrap_or(false) {
+                return;
+            }
+            let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+            let caller = call.get("caller").and_then(Value::as_str).unwrap_or("");
+            let group = call.get("group").and_then(Value::as_bool).unwrap_or(false);
+            // Cuộc gọi nhóm được báo bằng tên nhóm; chỉ khi đó mới kèm "ai gọi".
+            let fallback = if group { "Cuộc gọi nhóm" } else { "Một người bạn" };
+            let display = if name.is_empty() {
+                if caller.is_empty() { fallback } else { caller }
+            } else {
+                name
+            };
+            let app_handle = ctx.bridge.app_handle();
+            // Như `announceIncomingCall` trên macOS: chỉ notification khi app
+            // không ở trước (đang nhìn app thì banner trong trang là đủ).
+            let focused = app_handle
+                .as_ref()
+                .and_then(|app| {
+                    use tauri::Manager;
+                    app.get_webview_window("main")
+                })
+                .and_then(|window| window.is_focused().ok())
+                .unwrap_or(false);
+            if !focused {
+                match notify_rust::Notification::new()
+                    .summary("Cuộc gọi đến")
+                    .body(format!("{display} đang gọi cho bạn").as_str())
+                    .icon("olaz-linux")
+                    .action("default", "Mở")
+                    .timeout(notify_rust::Timeout::Milliseconds(15_000))
+                    .show()
+                {
+                    Ok(handle) => {
+                        std::thread::spawn(move || {
+                            handle.wait_for_action(|action| {
+                                if action == "default" {
+                                    if let Some(app) = app_handle {
+                                        use tauri::Manager;
+                                        if let Some(window) = app.get_webview_window("main") {
+                                            let _ = window.unminimize();
+                                            let _ = window.show();
+                                            let _ = window.set_focus();
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                    }
+                    Err(error) => eprintln!("[call] notification gọi đến lỗi: {error}"),
+                }
+            }
+            // Banner trong trang (thân ứng dụng không phải lúc nào cũng thấy
+            // notification của hệ thống).
+            push_js(format!(
+                "window.__olazCallUI && window.__olazCallUI.showBanner({call});"
+            ));
+        }
+        "picker" => {
+            // Như `NSApp.activate()` trên macOS: picker hiện ra thì đưa cửa sổ
+            // lên trước (người dùng có thể đang ở cửa sổ khác).
+            if let Some(window) = ctx.bridge.app_handle().and_then(|app| {
+                use tauri::Manager;
+                app.get_webview_window("main")
+            }) {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            push_js(format!(
+                "window.__olazCallUI && window.__olazCallUI.openPicker({call});"
+            ));
+        }
+        "pickerClosed" => {
+            let token = call.get("token").cloned().unwrap_or(Value::Null);
+            push_js(format!(
+                "window.__olazCallUI && window.__olazCallUI.closePicker({token});"
+            ));
+        }
+        "open" => {
+            // Cuộc gọi chỉ đặt được khi hội thoại đang mở (chat box điều khiển
+            // việc gọi) — adapter yêu cầu host mở trước (như open-conv.txt).
+            let Some(uid) = call.get("uid").and_then(Value::as_str).filter(|uid| !uid.is_empty()) else {
+                return;
+            };
+            let uid = serde_json::to_string(uid).unwrap_or_else(|_| "\"\"".to_string());
+            push_js(format!(
+                "window.__zaloChat && typeof window.__zaloChat.open === 'function' && window.__zaloChat.open({uid});"
+            ));
+        }
+        "result" => {
+            // Port `ZaloEngine.callFailureMessage`: lỗi đặt cuộc gọi → thông
+            // báo trong trang (macOS dùng alert; ở đây là toast).
+            let result = call.get("result").and_then(Value::as_str).unwrap_or("");
+            let group = call.get("group").and_then(Value::as_bool).unwrap_or(false);
+            let Some(message) = call_failure_message(result, group) else {
+                return;
+            };
+            let message = serde_json::to_string(&format!("Chưa gọi được: {message}"))
+                .unwrap_or_else(|_| "\"Chưa gọi được\"".to_string());
+            push_js(format!(
+                "window.__olazCallUI && window.__olazCallUI.toast({message});"
+            ));
+        }
+        _ => {}
+    }
+}
+
+/// Bản dịch 1:1 của `ZaloEngine.callFailureMessage` (message Việt hoá giữ
+/// nguyên; `started` → không báo).
+fn call_failure_message(result: &str, group: bool) -> Option<String> {
+    if group && result == "unavailable" {
+        return Some(
+            "Zalo không cho phép gọi nhóm này (nhóm có quá nhiều thành viên hoặc tài khoản chưa bật gọi nhóm)."
+                .into(),
+        );
+    }
+    match result {
+        "started" => None,
+        "busy" => Some("Bạn đang trong một cuộc gọi khác.".into()),
+        "offline" => Some("Không có kết nối mạng.".into()),
+        "unavailable" => Some(
+            "Zalo không cho phép gọi cho cuộc trò chuyện này (chỉ gọi được cho bạn bè).".into(),
+        ),
+        "unsupported" => Some("Tài khoản này chưa bật gọi điện trên Zalo PC.".into()),
+        "not-open" | "not-ready" => Some("Cuộc trò chuyện chưa sẵn sàng. Hãy thử lại sau ít giây.".into()),
+        "invalid" => Some("Danh sách người tham gia không hợp lệ. Hãy chọn lại.".into()),
+        _ => Some("Đã có lỗi khi bắt đầu cuộc gọi.".into()),
+    }
 }
 
 fn dev_target(value: Option<&str>) -> Result<&'static str, String> {
@@ -1908,6 +2060,7 @@ const HOST_SCRIPTS: &[(&str, &str)] = &[
     ("zcloud-adapter", include_str!("../../../Sources/Olaz/HostScripts/zcloud-adapter.js")),
     ("poll-adapter", include_str!("../../../Sources/Olaz/HostScripts/poll-adapter.js")),
     ("call-adapter", include_str!("../../../Sources/Olaz/HostScripts/call-adapter.js")),
+    ("call-ui", include_str!("../../web/call-ui.js")),
 ];
 
 /// The browser-side half of macOS `EngineProbe`: the React fiber tree (what
