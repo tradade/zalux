@@ -160,12 +160,20 @@ fn main() {
             // Tray icon (khay hệ thống / AppIndicator — GNOME cần extension
             // AppIndicator, máy này có sẵn): đóng cửa sổ thì app vẫn chạy nền
             // với icon; menu "Mở Olaz" mở lại, "Thoát" kết thúc hẳn.
-            use tauri::menu::{Menu, MenuItem};
+            use tauri::menu::{CheckMenuItem, Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
             use tauri::Manager;
             let open_item = MenuItem::with_id(app, "tray-open", "Mở Olaz", true, None::<&str>)?;
+            let autostart_item = CheckMenuItem::with_id(
+                app,
+                "tray-autostart",
+                "Khởi động cùng hệ thống",
+                true,
+                host::autostart_enabled(),
+                None::<&str>,
+            )?;
             let quit_item = MenuItem::with_id(app, "tray-quit", "Thoát", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&open_item, &quit_item])?;
+            let tray_menu = Menu::with_items(app, &[&open_item, &autostart_item, &quit_item])?;
             let mut tray = TrayIconBuilder::with_id("olaz-tray")
                 .menu(&tray_menu)
                 .tooltip("Olaz")
@@ -176,6 +184,17 @@ fn main() {
                             let _ = window.unminimize();
                             let _ = window.show();
                             let _ = window.set_focus();
+                        }
+                    }
+                    "tray-autostart" => {
+                        // Trạng thái chuẩn là file XDG autostart; sync lại item
+                        // (AppIndicator tự toggle hiển thị trước khi event tới).
+                        let enable = !host::autostart_enabled();
+                        host::set_autostart(enable);
+                        if let Some(kind) = app.menu().and_then(|menu| menu.get("tray-autostart")) {
+                            if let tauri::menu::MenuItemKind::Check(item) = kind {
+                                let _ = item.set_checked(enable);
+                            }
                         }
                     }
                     "tray-quit" => app.exit(0),

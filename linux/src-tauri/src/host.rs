@@ -1922,6 +1922,53 @@ pub fn userdata_dir() -> PathBuf {
 /// launching the AppImage directly leaves the window unowned: no icon in the
 /// dock and flaky minimize. Only runs from an AppImage (`$APPIMAGE` set); the
 /// icon files come from the mounted image's own `usr/share/icons`. Idempotent.
+
+/// XDG autostart entry (`~/.config/autostart/olaz-linux.desktop`) — trạng thái
+/// bật/tắt chính là sự tồn tại của file này; toggle từ tray menu.
+fn autostart_entry() -> PathBuf {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config"));
+    config.join("autostart/olaz-linux.desktop")
+}
+
+pub fn autostart_enabled() -> bool {
+    autostart_entry().is_file()
+}
+
+pub fn set_autostart(enabled: bool) {
+    let entry = autostart_entry();
+    if !enabled {
+        if entry.is_file() {
+            match std::fs::remove_file(&entry) {
+                Ok(()) => eprintln!("[olaz] autostart: đã tắt ({})", entry.display()),
+                Err(error) => eprintln!("[olaz] autostart: không xoá {}: {error}", entry.display()),
+            }
+        }
+        return;
+    }
+    // Exec: AppImage khi chạy từ AppImage, không thì binary hiện tại (cargo run).
+    let exec = std::env::var("APPIMAGE").unwrap_or_else(|_| {
+        std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default()
+    });
+    if exec.is_empty() {
+        eprintln!("[olaz] autostart: không xác định được binary — bỏ qua");
+        return;
+    }
+    let desktop = format!(
+        "[Desktop Entry]\nCategories=Network;\nComment=Client Zalo cho Linux\nExec=\"{}\"\n\
+         StartupWMClass=olaz-linux\nIcon=olaz-linux\nName=Olaz\nTerminal=false\nType=Application\n\
+         StartupNotify=true\nX-GNOME-UsesNotifications=true\nX-GNOME-Autostart-enabled=true\n",
+        exec
+    );
+    match std::fs::create_dir_all(entry.parent().unwrap()).and_then(|_| std::fs::write(&entry, desktop)) {
+        Ok(()) => eprintln!("[olaz] autostart: đã bật ({})", entry.display()),
+        Err(error) => eprintln!("[olaz] autostart: không ghi được {}: {error}", entry.display()),
+    }
+}
+
 pub fn install_desktop_entry() {
     let Ok(appimage) = std::env::var("APPIMAGE") else { return };
     let Some(exe) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|bin| bin.to_path_buf()))
