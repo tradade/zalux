@@ -10,6 +10,31 @@ Rust. Bản dựng AppImage/.deb phát hành qua
 viết bằng Swift (xem [`README-macOS.md`](README-macOS.md)). Repo này là bản port Linux của nó:
 20 host script trong `Sources/Olaz/HostScripts/` được nhúng nguyên văn và chạy không sửa một dòng nào.
 
+### Khác với bản macOS
+
+**Kiến trúc** (cách làm khác, tính năng giữ nguyên):
+
+- Bản macOS vẽ **UI SwiftUI riêng** và *ẩn* DOM của renderer; bản Linux **hiển thị chính DOM của
+  Zalo PC** trong WebKitGTK — giao diện đúng như Zalo PC, không có lớp UI native.
+- Bridge chạy qua **HTTP loopback** (27182) thay vì IPC của Tauri: WebKitGTK deadlock nếu trả lời
+  XHR blocking trên cùng thread như URL-scheme handler của WKWebView trên macOS.
+- Lưu trữ bằng **IndexedDB** thay vì port SQLCipher DAL; host script nhúng vào `/__olaz/boot.js`
+  thay vì `WKUserScript` (Tauri không inject với `WebviewUrl::External`).
+
+**Có thêm ở bản Linux** (bản macOS không có):
+
+- **Single-instance dialog**: mở lần 2 khi app đang chạy → hỏi "Đóng phiên cũ & mở mới / Huỷ".
+- **Tray icon + đóng cửa sổ chạy nền**: nhấn X chỉ ẩn vào khay (AppIndicator), notification vẫn đến.
+- **Tự cập nhật bản app**: check GitHub Releases → popup → tải AppImage mới, đối chiếu SHA-256,
+  tự thay file và khởi động lại, skip được từng phiên (macOS chỉ tự cập nhật runtime Zalo).
+- **Call dạng virtual helper**: không cần binary Qt — từ chối cuộc gọi đến (signal 405/12437),
+  picker nhóm là overlay HTML trong trang, banner gọi đến; macOS dùng cửa sổ native của `ZaloCall`.
+- Đóng gói **AppImage + .deb** với release workflow tự động (tag `linux-v*`), status page lần chạy
+  đầu, dev harness mở rộng (eval renderer từ CLI, route điều khiển sync).
+
+**Bản macOS có mà Linux chưa có**: cửa sổ gọi thoại/video với mic/camera (cần RE engine zrtc),
+`ZaloCap` chụp màn hình, transform E2EE khi upload file, de-noise media, SQLCipher database.
+
 > **Unofficial project, không liên quan tới VNG.** "Zalo" là thương hiệu của VNG. Dự án thuộc nhóm
 > nghiên cứu tương thích / reverse-engineering; dùng client không chính thức có thể mâu thuẫn ToS
 > của Zalo — dùng với tài khoản của bạn và tự chịu rủi ro.
@@ -277,7 +302,10 @@ Chưa có (khác bản macOS):
 * Điều khiển cửa sổ từ renderer (`minimize`, `toggle-maximize`, `focus-window`, `close-window`,
   badge) điều khiển cửa sổ Tauri thật; notification đi qua `notify-rust` (libnotify → GNOME) và
   click → `_noti_on-click` + focus cửa sổ.
-* `multipart/form-data` (upload ảnh/file) chưa dựng lại body; `fetch`/XHR dạng FormData sẽ lỗi.
+* `multipart/form-data` (upload ảnh/file) đã dựng lại body như `NetworkProxy.swift` trên macOS:
+  boundary kiểu Chromium 108 (`----WebKitFormBoundary` + 16 ký tự), part text/file với
+  `Content-Disposition`/`Content-Type`, và Content-Type luôn ghi đè thứ trang đoán
+  (`net.rs::apply_body`). File lớn đi qua bridge dạng base64-JSON (giới hạn ~100 MB/lần gửi).
 * `shared-worker.html` chạy trong một cửa sổ Tauri ẩn cùng origin; bridge chuyển tiếp
   `shared-worker-*` (đăng ký task, run/resp/progress/abort, remote config) giữa hai cửa sổ và
   gửi `receive-viewerkey` cho worker, giống `SharedWorkerRouter` bên macOS.

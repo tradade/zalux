@@ -84,13 +84,18 @@ pub fn perform_http(ctx: &AppContext, body: &Value) -> Value {
     } else {
         timeout
     };
-    let payload = match body.get("body") {
+    let (payload, content_type_override) = match body.get("body") {
         Some(encoded) => match apply_body(encoded) {
-            Ok(bytes) => bytes,
+            Ok((bytes, content_type)) => (bytes, content_type),
             Err(err) => return json!({ "error": err }),
         },
-        None => None,
+        None => (None, None),
     };
+    // multipart luôn ghi đè Content-Type mà trang đoán (như NetworkProxy.swift).
+    if let Some(content_type) = content_type_override {
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-type"));
+        headers.push(("content-type".to_string(), content_type));
+    }
 
     let started = std::time::Instant::now();
 
@@ -249,22 +254,71 @@ fn dump_login(url: &str) -> bool {
         && (url.contains("/api/login/") || url.contains("qr-id."))
 }
 
-fn apply_body(encoded: &Value) -> Result<Option<Vec<u8>>, String> {
+fn apply_body(encoded: &Value) -> Result<(Option<Vec<u8>>, Option<String>), String> {
     match encoded.get("kind").and_then(|v| v.as_str()) {
         Some("text") => {
             let text = encoded.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            Ok(Some(text.into_bytes()))
+            Ok((Some(text.into_bytes()), None))
         }
         Some("base64") => {
             let data = encoded.get("data").and_then(|v| v.as_str()).unwrap_or("");
-            base64::engine::general_purpose::STANDARD
+            let bytes = base64::engine::general_purpose::STANDARD
                 .decode(data)
                 .map(Some)
-                .map_err(|e| format!("bad body base64: {e}"))
+                .map_err(|e| format!("bad body base64: {e}"))?;
+            Ok((bytes, None))
         }
-        Some("formdata") => Err("multipart form data chưa được hỗ trợ trên Linux".into()),
-        _ => Ok(None),
+        // Dựng lại multipart body đúng như `NetworkProxy.swift` trên macOS:
+        // boundary kiểu Chromium, part text/file, và Content-Type luôn ghi đè
+        // thứ trang đã đoán.
+        Some("formdata") => {
+            let boundary = chromium_form_boundary();
+            let mut body: Vec<u8> = Vec::new();
+            for part in encoded.get("parts").and_then(Value::as_array).unwrap_or(&Vec::new()) {
+                let name = part.get("name").and_then(Value::as_str).unwrap_or("");
+                body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+                match part.get("filename").and_then(Value::as_str) {
+                    Some(filename) => {
+                        body.extend_from_slice(
+                            format!("Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n").as_bytes(),
+                        );
+                        let content_type = part
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("application/octet-stream");
+                        body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+                        let data = part.get("data").and_then(Value::as_str).unwrap_or("");
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .map_err(|e| format!("bad part base64 ({name}): {e}"))?;
+                        body.extend_from_slice(&bytes);
+                    }
+                    None => {
+                        body.extend_from_slice(
+                            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+                        );
+                        body.extend_from_slice(part.get("value").and_then(Value::as_str).unwrap_or("").as_bytes());
+                    }
+                }
+                body.extend_from_slice(b"\r\n");
+            }
+            body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+            Ok((Some(body), Some(format!("multipart/form-data; boundary={boundary}"))))
+        }
+        _ => Ok((None, None)),
     }
+}
+
+/// Boundary kiểu Chromium 108 (`----WebKitFormBoundary` + 16 ký tự), giống
+/// `NetworkProxy.chromiumFormBoundary()` của bản macOS.
+fn chromium_form_boundary() -> String {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut boundary = String::from("----WebKitFormBoundary");
+    for _ in 0..16 {
+        let index = rand::Rng::gen_range(&mut rand::thread_rng(), 0..ALPHABET.len());
+        boundary.push(ALPHABET[index] as char);
+    }
+    boundary
 }
 
 // ------------------------------------------------------------------ WebSockets
@@ -612,6 +666,40 @@ pub fn ws_close(body: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formdata_body_is_built_like_chromium() {
+        use base64::Engine;
+        let encoded = json!({
+            "kind": "formdata",
+            "parts": [
+                { "name": "file", "filename": "report.pdf", "type": "application/pdf",
+                  "data": base64::engine::general_purpose::STANDARD.encode(b"%PDF-hello") },
+                { "name": "note", "value": "xin chào" }
+            ]
+        });
+        let (body, content_type) = apply_body(&encoded).unwrap();
+        let content_type = content_type.unwrap();
+        assert!(content_type.starts_with("multipart/form-data; boundary=----WebKitFormBoundary"));
+        let boundary = content_type.rsplit('=').next().unwrap();
+        assert_eq!(boundary.len(), "----WebKitFormBoundary".len() + 16);
+        let body = body.unwrap();
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains("Content-Disposition: form-data; name=\"file\"; filename=\"report.pdf\"\r\n"));
+        assert!(text.contains("Content-Type: application/pdf\r\n"));
+        assert!(text.contains("%PDF-hello"));
+        assert!(text.contains("Content-Disposition: form-data; name=\"note\"\r\n\r\nxin chào"));
+        assert!(text.ends_with(&format!("--{boundary}--\r\n")));
+        // mọi separator đều dùng đúng boundary
+        assert_eq!(text.matches(boundary).count(), 3);
+    }
+
+    #[test]
+    fn text_body_has_no_content_type_override() {
+        let (body, content_type) = apply_body(&json!({ "kind": "text", "text": "hello" })).unwrap();
+        assert_eq!(body.unwrap(), b"hello");
+        assert!(content_type.is_none());
+    }
 
     #[test]
     fn frame_header_is_described_without_the_body() {
