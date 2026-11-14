@@ -1,19 +1,46 @@
-# Olaz — vỏ Tauri cho Linux
+# Zalux - Olaz linux version
 
-Bản chạy Olaz trên Linux: một cửa sổ Tauri (WebKitGTK) chứa **renderer chính thức của Zalo PC**
-(`app.asar`, do chính VNG phát hành), cộng với phần mà Electron's preload/main từng cung cấp —
-bridge `$z*`, proxy mạng, cookie, lưu trữ — viết lại bằng Rust.
+Repo này chứa **source của Zalux** — bản chạy Olaz trên Linux: một cửa sổ Tauri (WebKitGTK) chứa
+**renderer chính thức của Zalo PC** (`app.asar`, do chính VNG phát hành), cộng với phần mà
+Electron's preload/main từng cung cấp — bridge `$z*`, proxy mạng, cookie, lưu trữ — viết lại bằng
+Rust. Bản dựng AppImage/.deb phát hành qua
+**[Releases](https://github.com/tradade/zalux/releases)**.
+
+**Repo gốc**: [qnguyen3/zalo-swift-re](https://github.com/qnguyen3/zalo-swift-re) — bản macOS
+viết bằng Swift (xem [`README-macOS.md`](README-macOS.md)). Repo này là bản port Linux của nó:
+20 host script trong `Sources/Olaz/HostScripts/` được nhúng nguyên văn và chạy không sửa một dòng nào.
+
+> **Unofficial project, không liên quan tới VNG.** "Zalo" là thương hiệu của VNG. Dự án thuộc nhóm
+> nghiên cứu tương thích / reverse-engineering; dùng client không chính thức có thể mâu thuẫn ToS
+> của Zalo — dùng với tài khoản của bạn và tự chịu rủi ro.
 
 ## Tải bản dựng sẵn
 
-AppImage chính thức được build tự động và phát hành tại
-**[tradade/zalux — Releases](https://github.com/tradade/zalux/releases)** (kèm `SHA256SUMS`).
-Repo đó chứa cả source Linux port + workflow build; push tag `linux-v*` là
-[`.github/workflows/linux-release.yml`](https://github.com/tradade/zalux/blob/main/.github/workflows/linux-release.yml)
-build và đăng release tự động — chi tiết xem [`ZALUX-README.md`](linux/ZALUX-README.md).
+Vào tab **[Releases](https://github.com/tradade/zalux/releases)**, tải:
 
-Đây là bản port của [bản macOS](README-macOS.md), không phải bản viết lại giao diện: 20 host script
-trong `Sources/Olaz/HostScripts/` được nhúng nguyên văn và chạy không sửa một dòng nào.
+- `Olaz_*_amd64.AppImage` — bản dựng chính (~88 MB)
+- `Olaz_*_amd64.deb` — bản .deb cho distro dùng dpkg
+- `SHA256SUMS` — kiểm tra toàn vẹn: `sha256sum -c SHA256SUMS`
+
+**Chạy lần đầu:**
+
+```bash
+chmod +x Olaz_*_amd64.AppImage
+./Olaz_*_amd64.AppImage
+```
+
+- Lần chạy đầu app **tự tải runtime Zalo PC từ VNG** (~323 MB) và đối chiếu SHA-256 của bản ghim —
+  repo này **không phân phối code VNG**. Cần `p7zip-full` để giải nén.
+- Đăng nhập bằng QR từ Zalo trên điện thoại.
+- **Đồng bộ tin nhắn Điện thoại → PC**: Cài đặt → Đồng bộ tin nhắn, hoặc
+  `curl -X POST localhost:27182/__olaz/transfer/start` (chi tiết ở mục "Đồng bộ tin nhắn" dưới đây).
+
+**Yêu cầu hệ thống:** Linux x86_64 (đã test Ubuntu 22.04+; WebKitGTK 4.1). Chạy từ AppImage không
+cần cài gì — thư viện WebKitGTK phải có trên hệ thống (hầu hết distro desktop đã có; Ubuntu:
+`libwebkit2gtk-4.1-0`). GNOME cần extension AppIndicator để hiện icon tray khi đóng cửa sổ.
+
+**Cập nhật:** app tự cập nhật **runtime Zalo** (tải bản mới từ VNG khi có). AppImage mới theo
+release của repo này — ghé Releases để kiểm tra.
 
 ```
 Linux (Tauri / WebKitGTK)
@@ -164,6 +191,19 @@ bằng `OLAZ_ASAR` (hoặc đặt ở `<userData>/ZaloRuntime/Contents/Resources
 Nếu `CARGO_TARGET_DIR` được đặt (như môi trường build hiện tại, trỏ `/storage/cargo-target`), bundle
 nằm ở đó chứ không phải `linux/src-tauri/target`. Bản đã build và kiểm tra nằm ở
 `linux/dist/Olaz_1.0.0_amd64.AppImage` (81 MB, ELF x86-64).
+
+### Bản dựng release (GitHub Actions)
+
+Workflow `.github/workflows/linux-release.yml`:
+
+1. Push tag `linux-v*` (hoặc chạy tay `workflow_dispatch`).
+2. Runner Ubuntu cài WebKitGTK 4.1 dev + Rust stable + Go, chạy
+   `linux/scripts/build-appimage.sh` — build từ source, **không dùng artefact cục bộ**.
+3. AppImage + `.deb` + `SHA256SUMS` đính lên **Releases** của repo (tag cùng tên) qua
+   `GITHUB_TOKEN` — không cần PAT. Muốn phát hành sang repo khác, đặt env `DIST_REPO` +
+   secret `ZALUX_RELEASE_TOKEN`.
+
+Mỗi release ghi rõ nguồn build (repo@commit) — ai cũng tái hiện được bằng cùng một script.
 
 Chạy thử không cần FUSE:
 
