@@ -21,7 +21,7 @@ viết bằng Swift (xem [`README-macOS.md`](README-macOS.md)). Repo này là b�
 - Lưu trữ bằng **IndexedDB** thay vì port SQLCipher DAL; host script nhúng vào `/__olaz/boot.js`
   thay vì `WKUserScript` (Tauri không inject với `WebviewUrl::External`).
 
-**Có thêm ở bản Linux** (bản macOS không có):
+**Tính năng bổ sung** :
 
 - **Single-instance dialog**: mở lần 2 khi app đang chạy → hỏi "Đóng phiên cũ & mở mới / Huỷ".
 - **Tray icon + đóng cửa sổ chạy nền**: nhấn X chỉ ẩn vào khay (AppIndicator), notification vẫn đến;
