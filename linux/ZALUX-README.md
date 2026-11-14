@@ -33,7 +33,7 @@ chmod +x Olaz-*-amd64.AppImage
   `p7zip-full` để giải nén.
 - Đăng nhập bằng QR từ Zalo trên điện thoại.
 - **Đồng bộ tin nhắn Điện thoại → PC**: Cài đặt → Đồng bộ tin nhắn, hoặc
-  `curl -X POST localhost:27182/__olaz/transfer/start` (xem `linux/README.md`
+  `curl -X POST localhost:27182/__olaz/transfer/start` (xem `README.md`
   trong repo nguồn).
 
 ## Yêu cầu hệ thống
