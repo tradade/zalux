@@ -622,14 +622,26 @@ fn start_native(state: &mut State, events: &Events, debug: bool, tx: &Sender<Com
     };
     let recv_path = dir.join("recv");
     let send_path = dir.join("send");
-    match ProcessCommand::new(&executable)
+    let mut command = ProcessCommand::new(&executable);
+    command
         .arg(&recv_path)
         .arg(&send_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::null());
+    // Helper chết theo app: Linux tương đương `shutdown()` + `CallOrphans.reap`
+    // của bản macOS — SIGTERM khi tiến trình cha thoát, không bao giờ bỏ lại
+    // một ZaloCall mồ côi giữ socket đã chết.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    match command.spawn() {
         Ok(child) => {
             state.helper = Some(child);
             state.unavailable_logged = false;
