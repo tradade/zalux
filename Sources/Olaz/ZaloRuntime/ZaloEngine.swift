@@ -142,6 +142,10 @@ final class ZaloEngine {
     @ObservationIgnored internal var host: OfficialClientHost?
     /// Dedupes/throttles `resolveMedia` (ZaloEngine+Media.swift).
     @ObservationIgnored internal let mediaResolver = MediaResolver()
+    /// Sidecar full-text index of message bodies (`MessageSearchIndex.swift`); fed by the chat
+    /// merges below, erased at logout.
+    @ObservationIgnored internal let searchIndex = MessageSearchIndex(
+        directory: ZaloPlatform.defaultUserData.appendingPathComponent("olaz", isDirectory: true))
     @ObservationIgnored private var mainProcess: ZaloMainProcess?
     @ObservationIgnored private var platform: ZaloPlatform?
     @ObservationIgnored private var loginTimeout: Task<Void, Never>?
@@ -294,6 +298,7 @@ final class ZaloEngine {
     func logOut() {
         ZaloMainProcess.clearCookies()
         mainProcess?.resetAccountState()
+        Task { [searchIndex] in await searchIndex.erase() }
         profile = nil
         conversations = []
         conversationIndex = [:]
@@ -319,6 +324,7 @@ final class ZaloEngine {
         case .loggedOut:
             profile = nil
             CardActionCenter.shared.reset()
+            Task { [searchIndex] in await searchIndex.erase() }
             resetCardState()
             resetConversationActions()
             resetCloud()

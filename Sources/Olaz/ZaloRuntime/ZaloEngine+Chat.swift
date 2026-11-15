@@ -127,6 +127,11 @@ extension ZaloEngine {
         EngineLog.shared.write("chat merge conv=\(convId.prefix(4))… reset=\(reset) in=\(incoming.count) removed=\(removed.count) total=\(list.count) hasMore=\(chat["hasMore"] ?? "-")")
         if messages[convId] != list { messages[convId] = list }
         notePollMessages(incoming)
+        // Feed the search index off the main actor: the merge carries the changed/added
+        // messages and the removed ids of this conversation (MessageSearchIndex upserts by id).
+        if !incoming.isEmpty || !removed.isEmpty {
+            Task { [searchIndex] in await searchIndex.update(convId, upserted: incoming, removed: removed) }
+        }
         if let hasMore = chat["hasMore"] as? Bool, hasMoreHistory[convId] != hasMore { hasMoreHistory[convId] = hasMore }
         if chat["grew"] as? Bool == true { historyTicks[convId, default: 0] += 1 }
         if typing[convId] != nil, let newest = incoming.last, !newest.isMine, newest.date > Date().addingTimeInterval(-5) {
@@ -154,6 +159,12 @@ extension ZaloEngine {
 
     private static func chatMessage(_ json: [String: Any], fallbackConversation: String) -> ChatMessage? {
         ChatMessage(json: json, fallbackConversation: fallbackConversation)
+    }
+
+    /// Offline message search over the sidecar index (MessageSearchIndex): everything the
+    /// engine has seen, diacritic-insensitive for Vietnamese, newest first.
+    func searchMessages(_ query: String, limit: Int = 50) async -> [MessageSearchIndex.SearchHit] {
+        await searchIndex.search(query, limit: limit)
     }
 
     /// `window.__zaloChat[method](...args)`; arguments are JSON-encoded.

@@ -37,6 +37,8 @@ struct ConversationListColumn: View {
     @State private var showLabelManager = false
     /// Hidden conversations listed because the search text is the PIN.
     @State private var pinMatches: [String] = []
+    /// Offline message hits for the current search text (MessageSearchIndex, debounced).
+    @State private var messageHits: [MessageSearchIndex.SearchHit] = []
     /// The search text the PIN search last ran for (nil on the first run of this view: re-appearing is not a search change).
     @State private var lastSearch: String?
     /// The hidden-chat state did not arrive for a long while: say so instead of spinning forever (everything stays locked).
@@ -116,6 +118,14 @@ struct ConversationListColumn: View {
             .background { pinShortcuts(listing.pins) }
             .task(id: shell.search) {
                 pinMatches = query.count == 4 ? (await engine.hiddenConversations(matching: query) ?? []) : []
+                // Message search: two characters is enough intent; debounce so fast typing
+                // never queries between keystrokes (the task restart also cancels this sleep).
+                if query.count >= 2 {
+                    try? await Task.sleep(for: .milliseconds(300))
+                    if !Task.isCancelled { messageHits = await engine.searchMessages(query) }
+                } else {
+                    messageHits = []
+                }
                 // The search text really changed (not this view re-appearing) and no longer is the PIN: the bypass of an earlier result ends.
                 // Not while the mailbox itself is unlocked: that lives until "Khoá" or a minute away.
                 if let lastSearch, lastSearch != shell.search, pinMatches.isEmpty, shell.unlockedHiddenIds == nil { engine.conversationUI.relock() }
@@ -191,6 +201,14 @@ struct ConversationListColumn: View {
             }
             if isSearching {
                 Section("Cuộc trò chuyện") { rows(listing.rows) }
+                if !messageHits.isEmpty {
+                    Section("Tin nhắn") {
+                        ForEach(messageHits) { hit in
+                            MessageSearchRow(hit: hit, conversation: engine.conversations.first { $0.id == hit.conversationId })
+                                .listRowInsets(EdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10))
+                        }
+                    }
+                }
             } else {
                 rows(listing.rows)
             }
@@ -289,6 +307,49 @@ struct ConversationListColumn: View {
         shell.unlockedHiddenIds = nil
         engine.conversationUI.relock()
         if let selected = shell.selection, engine.conversationActions.isHidden(selected) { shell.selection = nil }
+    }
+}
+
+/// One offline message search result: the conversation (or sender) above, the match excerpt below.
+/// Tapping opens the conversation.
+private struct MessageSearchRow: View {
+    @Environment(ShellModel.self) private var shell
+    let hit: MessageSearchIndex.SearchHit
+    let conversation: ZaloEngine.ConversationSummary?
+
+    private var title: String {
+        conversation?.displayName ?? (hit.isMine ? "Bạn" : (hit.senderName.isEmpty ? "Người dùng Zalo" : hit.senderName))
+    }
+
+    private var snippet: String {
+        let sender = hit.isMine ? "Bạn" : hit.senderName
+        return sender.isEmpty ? hit.snippet : "\(sender): \(hit.snippet)"
+    }
+
+    var body: some View {
+        Button {
+            shell.search = ""
+            shell.selection = hit.conversationId
+        } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(title)
+                        .font(.callout).fontWeight(.medium)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text(hit.date, format: .dateTime.day().month().hour().minute())
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text(snippet)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            .contentShape(Rectangle())
+            .padding(.vertical, 2)
+        }
+        .buttonStyle(.plain)
     }
 }
 
