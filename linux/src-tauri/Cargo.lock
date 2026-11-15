@@ -2707,6 +2707,7 @@ dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "cbc",
+ "ctr",
  "gtk",
  "hmac",
  "image",
