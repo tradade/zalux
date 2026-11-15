@@ -40,6 +40,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+          # Git history đầy đủ để sinh changelog (git log giữa 2 tag).
+          fetch-depth: 0
 
       - name: Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -82,6 +84,23 @@ jobs:
           echo "artifact=Olaz-linux-packages" >> "$GITHUB_OUTPUT"
           cat out/SHA256SUMS
 
+      - name: Sinh changelog từ commit giữa 2 tag
+        if: startsWith(github.ref, 'refs/tags/linux-v')
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          RANGE="${PREV:+${PREV}..}${TAG}"
+          echo "Changelog range: ${RANGE:-<tag đầu tiên>}"
+          {
+            echo "## Thay đổi trong ${TAG}"
+            echo
+            if [ -n "$PREV" ]; then echo "_Từ ${PREV}_"; echo; fi
+            git log --no-merges --format='- %s' ${RANGE} \
+              | grep -v -iE '^- (README|changelog|ci)[:(]' || true
+            echo
+          } > out/changelog.md
+          cat out/changelog.md
+
       - name: Upload artefact (mọi lần chạy)
         uses: actions/upload-artifact@v4
         with:
@@ -101,6 +120,22 @@ jobs:
           name: ${{ needs.build.outputs.artifact }}
           path: out
 
+      - name: Ghép notes của release (header + changelog)
+        run: |
+          {
+            echo "Olaz Linux — bản dựng chính thức của tag \`${GITHUB_REF_NAME}\`."
+            echo
+            echo "- Nguồn: \`${GITHUB_REPOSITORY}@${GITHUB_SHA}\`"
+            echo "- Kiểm tra toàn vẹn: xem \`SHA256SUMS\` (\`sha256sum -c SHA256SUMS\`)"
+            echo "- Lần chạy đầu app tự tải runtime Zalo PC từ VNG (~323 MB) và"
+            echo "  kiểm tra SHA-256 của bản ghim — repo này không phân phối code VNG."
+            echo
+            if [ -f out/changelog.md ]; then cat out/changelog.md; fi
+            echo "**Unofficial project, không liên quan tới VNG.** Dùng với tài khoản"
+            echo "của bạn và tự chịu rủi ro theo ToS của Zalo."
+          } > out/release-notes.md
+          cat out/release-notes.md
+
       - name: Tạo release
         uses: softprops/action-gh-release@v2
         with:
@@ -109,16 +144,7 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: Olaz Linux ${{ github.ref_name }}
           fail_on_unmatched_files: true
-          body: |
-            Olaz Linux — bản dựng chính thức của tag `${{ github.ref_name }}`.
-
-            - Nguồn: `${{ github.repository }}@${{ github.sha }}`
-            - Kiểm tra toàn vẹn: xem `SHA256SUMS` (`sha256sum -c SHA256SUMS`)
-            - Lần chạy đầu app tự tải runtime Zalo PC từ VNG (~323 MB) và
-              kiểm tra SHA-256 của bản ghim — repo này không phân phối code VNG.
-
-            **Unofficial project, không liên quan tới VNG.** Dùng với tài khoản
-            của bạn và tự chịu rủi ro theo ToS của Zalo.
+          body_path: out/release-notes.md
           files: |
             out/*.AppImage
             out/*.deb
