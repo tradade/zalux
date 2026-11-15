@@ -153,7 +153,7 @@ fn incoming_flow_accept_and_end() {
         "session": "sess-incoming",
         "params": {"Dname": "Lan", "avatar": "a.png", "extendData": "{\"callType\": 0, \"serverAddr\": [{\"rtpIPv6\": \"\", \"rtcpIPv6\": \"\"}]}"}
     });
-    let out = e.handle_control(now, "request", &request);
+let out = e.handle_control(now, "request", &json!({"data": request}));
     assert_eq!(codes(&out), vec![407]);
     assert_eq!(updates(&out)[0], ("callState".into(), json!({"state": "incall"})));
     assert!(out.iter().any(|o| matches!(o, Out::Request { command, .. } if command == "getAliasName")));
@@ -189,7 +189,7 @@ fn incoming_flow_accept_and_end() {
     assert!(!e.in_call());
 
     // The same request again (delayed duplicate) is dropped by the ended-call cache.
-    let out = e.handle_control(now + 2_100.0, "request", &request);
+    let out = e.handle_control(now + 2_100.0, "request", &json!({"data": request}));
     assert!(out.is_empty());
 }
 
@@ -197,7 +197,7 @@ fn incoming_flow_accept_and_end() {
 fn incoming_reject_sends_402_status_3() {
     let mut e = engine(false);
     let now = 1_000.0;
-    e.handle_control(now, "request", &json!({"uidN": "5678", "uidFrom": 5678, "uidTo": 1234, "callId": 7, "params": {}}));
+e.handle_control(now, "request", &json!({"data": {"uidN": "5678", "uidFrom": 5678, "uidTo": 1234, "callId": 7, "params": {}}}));
     let out = e.reject(now, "user");
     assert_eq!(codes(&out), vec![402, 406]);
     assert_eq!(find_signal(&out, 402)["status"], 3);
@@ -245,7 +245,7 @@ fn incoming_while_busy_is_ignored() {
     let mut e = engine(false);
     let now = 0.0;
     e.make_call(now, &json!({"type": 1, "partner": [{"id": "5678"}]}));
-    let out = e.handle_control(now, "request", &json!({"uidN": "9999", "callId": 55, "params": {}}));
+let out = e.handle_control(now, "request", &json!({"data": {"uidN": "9999", "callId": 55, "params": {}}}));
     assert!(out.is_empty());
     assert_eq!(e.call.as_ref().unwrap().peer_id, "5678");
 }
@@ -254,7 +254,7 @@ fn incoming_while_busy_is_ignored() {
 fn other_device_answer_ends_our_incoming() {
     let mut e = engine(false);
     let now = 0.0;
-    e.handle_control(now, "request", &json!({"uidN": "5678", "uidFrom": 5678, "uidTo": 1234, "callId": 42, "params": {}}));
+e.handle_control(now, "request", &json!({"data": {"uidN": "5678", "uidFrom": 5678, "uidTo": 1234, "callId": 42, "params": {}}}));
     let out = e.handle_control(now, "answer", &json!({"data": {"callId": 42}}));
     assert_eq!(codes(&out), Vec::<i64>::new()); // silent finish(0): no 406 for a multi-device takeover
     assert!(!e.in_call());
@@ -265,7 +265,7 @@ fn other_device_answer_ends_our_incoming() {
 fn server_unreachable_on_prepare_fails_the_call() {
     let mut e = engine(true); // sendUdp = true, no relay answered
     let now = 0.0;
-    e.handle_control(now, "request", &json!({"uidN": "5678", "uidFrom": 5678, "uidTo": 1234, "callId": 42, "session": "s", "rtpAddress": "x", "rtcpAddress": "y", "params": {}}));
+e.handle_control(now, "request", &json!({"data": {"uidN": "5678", "uidFrom": 5678, "uidTo": 1234, "callId": 42, "session": "s", "rtpAddress": "x", "rtcpAddress": "y", "params": {}}}));
     e.accept(now);
     let out = e.media_prepared(now, None);
     // The 402 still goes out (matches the original); the call was already
@@ -276,21 +276,17 @@ fn server_unreachable_on_prepare_fails_the_call() {
 }
 
 #[test]
-fn group_call_notice_is_not_supported_yet() {
+fn group_call_outgoing_signals_12433() {
     let mut e = engine(false);
     let now = 0.0;
-    let out = e.make_call(now, &json!({"type": 5, "groupInfo": {"name": "Nhóm A"}}));
-    assert!(out.iter().any(|o| matches!(o, Out::Ui(x) if x.status_code() == "groupUnsupported")));
-    assert_eq!(updates(&out).last().unwrap().1["state"], "free");
-    assert!(!e.in_call());
+    let out = e.make_call(now, &json!({"type": 5, "groupInfo": {"name": "Nhóm A", "id": "g1"}, "partner": [{"id": "5678", "name": "Lan"}]}));
+    assert_eq!(codes(&out), vec![12433]);
+    let s = find_signal(&out, 12433);
+    assert_eq!(s["data"]["groupName"], "Nhóm A");
+    assert_eq!(s["data"]["noiseId"], json!(["5678"]));
+    assert!(out.iter().any(|o| matches!(o, Out::Ui(x) if x.status_code() == "groupCalling")));
+    assert_eq!(updates(&out)[0], ("callState".into(), json!({"state": "incall"})));
+    assert!(e.in_call());
 }
 
-impl super::engine::UiEvent {
-    fn status_code(&self) -> &str {
-        match self {
-            super::engine::UiEvent::Open { status_code, .. } | super::engine::UiEvent::Incoming { status_code, .. } => status_code,
-            super::engine::UiEvent::Status(s) => s,
-            super::engine::UiEvent::Close { code } => code,
-        }
-    }
-}
+

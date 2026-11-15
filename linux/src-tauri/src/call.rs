@@ -168,6 +168,10 @@ enum Command {
     Reset,
     /// Người dùng từ chối cuộc gọi đến (banner in-page, virtual mode).
     Decline,
+    /// Người dùng nhận cuộc gọi đến (zrtc engine mode).
+    Accept,
+    /// Điều khiển trong cuộc gọi (zrtc engine): {"action":"end"}…
+    CallControl(Value),
     /// Kết nối mới trên socket send (bản ghi để worker ghi).
     SendUp { conn: usize, stream: UnixStream },
     /// Helper xác nhận một khúc (ghi lại bất kỳ dữ liệu gì).
@@ -201,6 +205,14 @@ impl CallHandle {
     pub fn decline(&self) {
         let _ = self.tx.send(Command::Decline);
     }
+
+    pub fn accept(&self) {
+        let _ = self.tx.send(Command::Accept);
+    }
+
+    pub fn call_control(&self, data: Value) {
+        let _ = self.tx.send(Command::CallControl(data));
+    }
 }
 
 struct State {
@@ -230,6 +242,8 @@ struct State {
     // Virtual mode: danh sách thiết bị từ init data + cuộc gọi đến đang reo.
     virtual_devices: Option<Value>,
     virtual_incoming: Option<Value>,
+    /// zrtc engine mode: máy trạng thái + media thật (OLAZ_CALL_ENGINE=zrtc).
+    zrtc: Option<crate::zrtc::engine::Engine<crate::zrtc::media::ZrtcMedia>>,
 }
 
 impl State {
@@ -256,6 +270,7 @@ impl State {
             send_generations: HashMap::new(),
             virtual_devices: None,
             virtual_incoming: None,
+            zrtc: None,
         }
     }
 }
@@ -265,6 +280,9 @@ impl State {
 enum Mode {
     /// Binary ngoài qua `OLAZ_CALL_HELPER` (khi có helper tương thích).
     External,
+    /// Máy trạng thái + media engine zrtc trong Rust (`OLAZ_CALL_ENGINE=zrtc`):
+    /// nhận máy được (402), audio qua cpal+Opus.
+    Zrtc,
     /// Mặc định: không có binary — xử lý mức UI ngay trong Rust
     /// (trả lời `listDevice`, theo dõi cuộc gọi đến, từ chối).
     Virtual,
@@ -273,6 +291,11 @@ enum Mode {
 }
 
 fn helper_mode() -> Mode {
+    // zrtc engine (media thật) opt-in qua OLAZ_CALL_ENGINE=zrtc — ưu tiên hơn
+    // helper mode; mặc định vẫn là virtual để không phá hành vi từ chối.
+    if std::env::var("OLAZ_CALL_ENGINE").map(|v| v.trim() == "zrtc").unwrap_or(false) {
+        return Mode::Zrtc;
+    }
     match std::env::var("OLAZ_CALL_HELPER") {
         Ok(value) => match value.trim() {
             "" | "none" | "off" => Mode::Off,
@@ -305,6 +328,7 @@ fn worker(
     let mut state = State::new(mode);
     match mode {
         Mode::Virtual => log(debug, "call: helper nội bộ (virtual) — không có cửa sổ thoại, có thể từ chối cuộc gọi đến"),
+        Mode::Zrtc => log(debug, "call: zrtc engine (OLAZ_CALL_ENGINE=zrtc) — nhận máy được, audio cpal+Opus"),
         Mode::External => log(debug, "call: helper ngoài (OLAZ_CALL_HELPER)"),
         Mode::Off => log(debug, "call: helper bị tắt (OLAZ_CALL_HELPER=none)"),
     }
@@ -313,6 +337,9 @@ fn worker(
             Ok(command) => handle(&mut state, &events, debug, &tx, command),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if mode == Mode::Zrtc {
+            zrtc_tick(&mut state, &events, debug);
         }
         // Helper thoát (reap zombie) + escalation sau `killMe`.
         reap_helper(&mut state, &events, debug, &tx);
@@ -324,6 +351,7 @@ fn handle(state: &mut State, events: &Events, debug: bool, tx: &Sender<Command>,
     match command {
         Command::SendToNative { json, optional } => match state.mode {
             Mode::Virtual => virtual_message(state, events, debug, json),
+            Mode::Zrtc => zrtc_message(state, events, debug, json),
             Mode::External => {
                 if !optional {
                     start_native(state, events, debug, tx);
@@ -335,6 +363,24 @@ fn handle(state: &mut State, events: &Events, debug: bool, tx: &Sender<Command>,
         Command::Init(json) => state.init_json = json,
         Command::Reset => reset(state, debug),
         Command::Decline => decline_incoming(state, events, debug),
+        Command::Accept => {
+            if let Some(engine) = &mut state.zrtc {
+                let now = now_ms();
+                let out = engine.accept(now);
+                engine_out(events, out);
+            }
+        }
+        Command::CallControl(data) => {
+            let action = data.get("action").and_then(Value::as_str).unwrap_or("");
+            if let Some(engine) = &mut state.zrtc {
+                let now = now_ms();
+                match action {
+                    "end" => engine_out(events, engine.hangup(now, "user")),
+                    "mute" => log(debug, "call: mute trong cuộc gọi — port 12006 ở bước sau"),
+                    _ => {}
+                }
+            }
+        }
         Command::SendUp { conn, stream } => {
             log(debug, "call: send connection");
             state.send_generations.insert(conn, state.generation);
@@ -566,6 +612,105 @@ fn decline_incoming(state: &mut State, events: &Events, debug: bool) {
     log(debug, "call: đã từ chối cuộc gọi đến");
 }
 
+/// zrtc engine mode: xử lý message renderer (init/makeCall/control) qua engine.
+fn zrtc_message(state: &mut State, events: &Events, debug: bool, json: String) {
+    let Ok(message) = serde_json::from_str::<Value>(&json) else {
+        log(debug, "call: không parse được message từ renderer");
+        return;
+    };
+    let kind = message.get("type").and_then(Value::as_str).unwrap_or("");
+    let command = message.get("command").and_then(Value::as_str).unwrap_or("");
+    let now = now_ms();
+    // Engine được tạo ở init đầu tiên (cần local id/avatar cho 401/extendData).
+    if state.zrtc.is_none() && kind == "update" && matches!(command, "init" | "updateLocal") {
+        let local = message.get("data").cloned().unwrap_or(json!({}));
+        state.zrtc = Some(crate::zrtc::engine::Engine::new(crate::zrtc::media::ZrtcMedia::spawn(), local));
+        log(debug, "call: zrtc engine sẵn sàng");
+    }
+    let Some(engine) = &mut state.zrtc else { return };
+    match (kind, command) {
+        ("update", "init" | "updateLocal") => {
+            // init data mới (đổi máy/device): local đã nạp; giữ listDevice như virtual.
+            if let Some(data) = message.get("data") {
+                state.virtual_devices = Some(data.clone());
+            }
+        }
+        ("request", "makeCall") => {
+            let out = engine.make_call(now, &message.get("data").cloned().unwrap_or(Value::Null));
+            engine_out(events, out);
+        }
+        ("request", "endCall") => {
+            let out = engine.hangup(now, "zalo");
+            engine_out(events, out);
+        }
+        ("control", _) => {
+            let Some(control) = message.get("data") else { return };
+            let act = control.get("act").and_then(Value::as_str).unwrap_or("");
+            let out = engine.handle_control(now, act, control);
+            engine_out(events, out);
+        }
+        ("response", "getAliasName") => {
+            // Alias hiển thị — phase sau; signalling không phụ thuộc.
+        }
+        _ => {}
+    }
+}
+
+/// Tick worker: media events (registration done, peer audio, fault) + deadline.
+fn zrtc_tick(state: &mut State, events: &Events, debug: bool) {
+    let Some(engine) = &mut state.zrtc else { return };
+    let now = now_ms();
+    for event in engine.media.drain_events() {
+        let out = match event {
+            crate::zrtc::media::MediaEvent::Prepared(best) => engine.media_prepared(now, best),
+            crate::zrtc::media::MediaEvent::EarlyAudio(phase) => engine.early_audio(now, phase),
+            crate::zrtc::media::MediaEvent::GroupRoster(roster) => engine.group_roster(now, &roster),
+            crate::zrtc::media::MediaEvent::Fault(kind) => {
+                log(debug, &format!("call: audio fault ({kind}) — call vẫn tiếp tục nhận-only"));
+                vec![]
+            }
+        };
+        engine_out(events, out);
+    }
+    let out = engine.tick(now);
+    engine_out(events, out);
+}
+
+/// Map engine events onto the existing bridge channels.
+fn engine_out(events: &Events, out: Vec<crate::zrtc::engine::Out>) {
+    for event in out {
+        match event {
+            crate::zrtc::engine::Out::SendSignal { code, data } => {
+                emit(events, "call-send-signal", &[json!(code), data]);
+            }
+            crate::zrtc::engine::Out::Update { command, data } => {
+                // Panel in-call của call-ui.js (channel riêng, renderer không ăn).
+                if command == "callState" {
+                    emit(events, "call-ui", &[data.clone()]);
+                }
+                emit(events, "call-update", &[json!(command), data]);
+            }
+            crate::zrtc::engine::Out::Request { command, data } => {
+                emit(events, "call-request", &[json!(command), data]);
+            }
+            crate::zrtc::engine::Out::Response { command, data } => {
+                emit(events, &format!("call-response-{command}"), &[data]);
+            }
+            crate::zrtc::engine::Out::Ui(ui) => {
+                // Banner cuộc gọi đến do chính renderer vẽ (nó relay control);
+                // trạng thái trong cuộc gọi đi qua callState phía trên.
+                if let crate::zrtc::engine::UiEvent::Status(code) = ui {
+                    emit(events, "call-ui", &[json!({"status": code})]);
+                }
+            }
+        }
+    }
+}
+
+fn now_ms() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0)
+}
+
 fn first_string(value: &Value, keys: &[&str]) -> String {
     for key in keys {
         match value.get(key) {
@@ -656,6 +801,9 @@ fn start_native(state: &mut State, events: &Events, debug: bool, tx: &Sender<Com
 }
 
 fn reset(state: &mut State, debug: bool) {
+    // zrtc engine: logout/reset → dừng media + xoá máy trạng thái (lần init
+    // sau sẽ tạo lại).
+    state.zrtc = None;
     state.restart_after_exit = false;
     state.init_json = None;
     state.pending.clear();

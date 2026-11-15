@@ -9,18 +9,31 @@
 // the state machine, srtp and rtp modules land.
 #![allow(dead_code)]
 
+pub mod audio;
 pub mod bytes;
 pub mod engine;
+pub mod group;
+pub mod media;
 pub mod rtp;
 pub mod rtcp;
 pub mod srtp;
+pub mod video;
 pub mod wire;
 
 #[cfg(test)]
 mod engine_tests;
 
 #[cfg(test)]
+mod group_tests;
+
+#[cfg(test)]
 mod rtp_rtcp_tests;
+
+#[cfg(test)]
+mod video_tests;
+
+#[cfg(test)]
+mod wire_fake_reply_tests;
 
 #[cfg(test)]
 mod wire_tests;

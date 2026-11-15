@@ -44,6 +44,16 @@ pub enum Out {
     Ui(UiEvent),
 }
 
+impl UiEvent {
+    pub(crate) fn status_code(&self) -> &str {
+        match self {
+            UiEvent::Open { status_code, .. } | UiEvent::Incoming { status_code, .. } => status_code,
+            UiEvent::Status(s) => s,
+            UiEvent::Close { code } => code,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiEvent {
     Open { title: String, status_code: String, avatar: String, video: bool, self_avatar: String },
@@ -69,12 +79,14 @@ pub enum State {
     Calling,
     Ringing,
     Incoming,
+    Connecting,
     Connected,
+    Failed,
     Ended,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Deadline {
+pub(crate) enum Deadline {
     Setup,
     Ring,
 }
@@ -99,6 +111,67 @@ pub struct Call {
     pub started_at: f64,
     pub deadline: Option<(f64, Deadline)>,
     pub muted: bool,
+    // ---- group call (C3) ----
+    pub group: bool,
+    pub host_call: f64,
+    pub group_id_str: String,
+    pub group_id: f64,
+    pub title: String,
+    pub max_users: f64,
+    pub invited: Vec<String>,
+    pub invite_partners: Option<Vec<(String, String, String)>>, // (name, avatar, id)
+    pub members: Vec<(MemberKey, Member)>,
+    pub ping_ms: f64,
+    pub answered: bool,
+    pub ping_deadline: Option<f64>,
+    pub greeted: Vec<f64>,
+    pub members_key: String,
+    pub has_status_text: bool,
+    pub status_text: String,
+    pub camera_on: Option<bool>,
+    pub ring_deadline: Option<(f64, f64)>, // (at, ms) group no-answer timer
+}
+
+/// Group member identity: numeric uid once known, else the invite key string.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemberKey {
+    Uid(f64),
+    Str(String),
+}
+
+impl MemberKey {
+    pub fn of_uid(uid: f64) -> Self {
+        MemberKey::Uid(uid)
+    }
+
+    pub fn of_str(s: String) -> Self {
+        MemberKey::Str(s)
+    }
+
+    /// The JSON shape the UI list uses (`src`).
+    pub fn to_json(&self) -> Value {
+        match self {
+            MemberKey::Uid(u) => num_json(*u),
+            MemberKey::Str(s) => json!(s),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Member {
+    pub name: String,
+    pub avatar: String,
+    /// "calling" | "ringing" | "incall" | "left"
+    pub state: String,
+    pub muted: bool,
+    pub cam_off: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemberInfo {
+    pub state: Option<String>,
+    pub muted: Option<bool>,
+    pub cam_off: Option<bool>,
 }
 
 /// What the media backend must do when the engine tells it to. The real
@@ -127,6 +200,12 @@ pub struct NegotiatedParams {
     pub local_uid: f64,
     pub peer_uid: f64,
     pub p2p: Value,
+    /// Group-call media: group init layouts, ZaviPing, RoomUpdated roster.
+    pub group: bool,
+    /// Group host (the caller that created the room).
+    pub host: bool,
+    /// Host uid (group init layout needs it).
+    pub host_call: f64,
 }
 
 /// The relay registration outcome for the chosen server (`None` = no server
@@ -138,11 +217,62 @@ pub struct InitReply {
 }
 
 /// JS `Number` semantics for ids: integers stay integers on the wire.
-fn num_json(v: f64) -> Value {
+pub(crate) fn num_json(v: f64) -> Value {
     if v.fract() == 0.0 && v.abs() < 9.007_199_254_740_992e15 {
         json!(v as i64)
     } else {
         json!(v)
+    }
+}
+
+/// JS `String(number)`: integers without the `.0`.
+pub(crate) fn fmt_num(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 9.007_199_254_740_992e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
+impl Call {
+    /// Baseline for the group builders (`..Call::voice_template()`).
+    pub(crate) fn voice_template() -> Self {
+        Self {
+            role: Role::Caller,
+            state: State::Calling,
+            peer_id: String::new(),
+            peer_uid: 0.0,
+            local_uid: 0.0,
+            peer_name: String::new(),
+            avatar: String::new(),
+            call_type: 0.0,
+            call_id: 0.0,
+            sess_id: Value::Null,
+            server: Value::Null,
+            config: Value::Null,
+            p2p: Value::Null,
+            started_at: 0.0,
+            deadline: None,
+            muted: false,
+            group: false,
+            host_call: 0.0,
+            group_id_str: String::new(),
+            group_id: 0.0,
+            title: String::new(),
+            max_users: 8.0,
+            invited: Vec::new(),
+            invite_partners: None,
+            members: Vec::new(),
+            ping_ms: 9000.0,
+            answered: false,
+            ping_deadline: None,
+            greeted: Vec::new(),
+            members_key: String::new(),
+            has_status_text: false,
+            status_text: String::new(),
+            camera_on: None,
+            ring_deadline: None,
+        }
     }
 }
 
@@ -169,6 +299,14 @@ fn obj(v: Option<&Value>) -> Map<String, Value> {
 }
 
 /// Parses a stringified-JSON field (`params`, `extendData` arrive double-encoded).
+pub(crate) fn parse_maybe_json_value(v: Option<&Value>) -> Value {
+    match v {
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+        Some(v) => v.clone(),
+        None => Value::Null,
+    }
+}
+
 fn parse_maybe_json(v: Option<&Value>) -> Map<String, Value> {
     match v {
         Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok().and_then(|p| p.as_object().cloned()).unwrap_or_default(),
@@ -208,28 +346,9 @@ impl<M: Media> Engine<M> {
         let call_type = num_of(d.get("type"));
         let group_info = d.get("groupInfo");
         if matches!(call_type, 5.0 | 6.0) || truthy(group_info) {
-            // Group calls: signalling exists (phase 3); until then mirror the
-            // original's not-supported notice instead of pretending.
-            let g = obj(group_info);
-            let name = {
-                let n = str_or(g.get("name"));
-                if n.is_empty() { str_or(g.get("groupName")) } else { n }
-            };
-            let name = if name.is_empty() { "Gọi nhóm".to_string() } else { name };
-            let avatar = str_or(g.get("avatar"));
-            let mut out = vec![
-                Out::Response { command: "show".into(), data: json!({"error": 0, "extendData": "success"}) },
-                Out::Update { command: "callState".into(), data: json!({"state": "free"}) },
-                Out::Ui(UiEvent::Open {
-                    title: name,
-                    status_code: "groupUnsupported".into(),
-                    avatar,
-                    video: false,
-                    self_avatar: self.self_avatar(),
-                }),
-            ];
-            out
-        } else {
+            return self.group_outgoing(now, data);
+        }
+        {
             let partner = d.get("partner").and_then(Value::as_array).and_then(|a| a.first()).cloned().unwrap_or(Value::Null);
             let p = obj(Some(&partner));
             let call = Call {
@@ -249,6 +368,24 @@ impl<M: Media> Engine<M> {
                 started_at: 0.0,
                 deadline: None,
                 muted: false,
+                group: false,
+                host_call: 0.0,
+                group_id_str: String::new(),
+                group_id: 0.0,
+                title: String::new(),
+                max_users: 8.0,
+                invited: Vec::new(),
+                invite_partners: None,
+                members: Vec::new(),
+                ping_ms: 9000.0,
+                answered: false,
+                ping_deadline: None,
+                greeted: Vec::new(),
+                members_key: String::new(),
+                has_status_text: false,
+                status_text: String::new(),
+                camera_on: None,
+                ring_deadline: None,
             };
             let peer_name = call.peer_name.clone();
             let avatar = call.avatar.clone();
@@ -279,6 +416,9 @@ impl<M: Media> Engine<M> {
         if call.state == State::Ended {
             return vec![];
         }
+        if call.group {
+            return self.group_hangup(now, why);
+        }
         if call.state == State::Incoming {
             return self.reject(now, why);
         }
@@ -302,6 +442,9 @@ impl<M: Media> Engine<M> {
 
     /// UI accept of an incoming call.
     pub fn accept(&mut self, now: f64) -> Vec<Out> {
+        if self.call.as_ref().is_some_and(|c| c.group && c.state == State::Incoming) {
+            return self.group_answer(now);
+        }
         let Some(call) = &mut self.call else { return vec![] };
         if call.role != Role::Callee || call.state != State::Incoming {
             return vec![];
@@ -320,6 +463,9 @@ impl<M: Media> Engine<M> {
             local_uid: call.local_uid,
             peer_uid: call.peer_uid,
             p2p: call.p2p.clone(),
+            group: false,
+            host: false,
+            host_call: 0.0,
         };
         self.media.on_negotiated(&params);
         self.media.prepare(Role::Callee);
@@ -331,6 +477,9 @@ impl<M: Media> Engine<M> {
 
     /// Relay registration completed. `None` = no server answered.
     pub fn media_prepared(&mut self, now: f64, best: Option<InitReply>) -> Vec<Out> {
+        if self.call.as_ref().is_some_and(|c| c.group) {
+            return self.group_prepared(now, &best);
+        }
         let Some(call) = &mut self.call else { return vec![] };
         let role = call.role;
         if role != Role::Callee {
@@ -395,6 +544,9 @@ impl<M: Media> Engine<M> {
 
     /// UI decline of an incoming call.
     pub fn reject(&mut self, now: f64, why: &str) -> Vec<Out> {
+        if self.call.as_ref().is_some_and(|c| c.group && c.state == State::Incoming) {
+            return self.group_reject(now);
+        }
         let Some(call) = &self.call else { return vec![] };
         if call.role != Role::Callee || call.state != State::Incoming {
             return vec![];
@@ -424,6 +576,9 @@ impl<M: Media> Engine<M> {
     /// A voip control frame (`act` + the control `data` object).
     pub fn handle_control(&mut self, now: f64, act: &str, data: &Value) -> Vec<Out> {
         let d = obj(data.get("data").filter(|v| v.is_object()));
+        if act.starts_with("group_") {
+            return self.on_group_control(now, act, &d);
+        }
         let call_id = d
             .get("callId")
             .filter(|v| !v.is_null())
@@ -435,7 +590,9 @@ impl<M: Media> Engine<M> {
             has_id && num_of(call_id) != c.call_id
         });
         match act {
-            "request" => self.incoming(now, data),
+            // The original passes the *inner* data object to incoming(); the
+            // wrapper (act + data) is this function's own argument.
+            "request" => self.incoming(now, &Value::Object(d)),
             "ring_ring" => {
                 if let Some(call) = &mut self.call {
                     if call.state == State::Calling {
@@ -498,6 +655,18 @@ impl<M: Media> Engine<M> {
 
     /// A `recvSignal` reply to one of our signals.
     pub fn handle_recv_signal(&mut self, now: f64, command: &str, data: &Value) -> Vec<Out> {
+        if command == "12433" {
+            return self.group_request_answered(now, data);
+        }
+        if command == "12097" {
+            // Group ping reply: error != 0 → finish trừ khi media còn chảy.
+            let reply = parse_maybe_json_value(data.get("data"));
+            let error = reply.get("error").and_then(Value::as_f64).unwrap_or(0.0);
+            if self.call.as_ref().is_some_and(|c| c.group && c.state == State::Connected) && error != 0.0 {
+                return self.group_ping_failed(now, error, Some(f64::INFINITY));
+            }
+            return vec![];
+        }
         if command == "401" {
             let Some(call) = &mut self.call else { return vec![] };
             if call.state != State::Calling {
@@ -530,6 +699,9 @@ impl<M: Media> Engine<M> {
                 local_uid: call.local_uid,
                 peer_uid: num_of(data.get("toId")),
                 p2p: Value::Null,
+                group: false,
+                host: false,
+                host_call: 0.0,
             };
             let call_id = call.call_id;
             self.media.on_negotiated(&params);
@@ -583,7 +755,7 @@ impl<M: Media> Engine<M> {
 
     // ------------------------------------------------------------- internals
 
-    fn new_call_id(&self, now: f64) -> f64 {
+    pub(crate) fn new_call_id(&self, now: f64) -> f64 {
         // Random in [1e9, 2^31), like the original. The seed mixes the clock
         // and a process-unique counter; the id only has to be unique per call.
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -592,7 +764,7 @@ impl<M: Media> Engine<M> {
         1e9 + frac * (2f64.powi(31) - 1e9)
     }
 
-    fn self_avatar(&self) -> String {
+    pub(crate) fn self_avatar(&self) -> String {
         str_or(self.local.get("avatar"))
     }
 
@@ -605,6 +777,9 @@ impl<M: Media> Engine<M> {
 
     /// Fires the call deadline when due; returns the events (usually none).
     pub fn tick(&mut self, now: f64) -> Vec<Out> {
+        if self.call.as_ref().is_some_and(|c| c.group) {
+            return self.group_tick(now);
+        }
         let due = self.call.as_ref().and_then(|c| c.deadline).filter(|(at, _)| *at <= now);
         let Some((_, kind)) = due else { return vec![] };
         let state = self.call.as_ref().map(|c| c.state);
@@ -681,6 +856,24 @@ impl<M: Media> Engine<M> {
             started_at: 0.0,
             deadline: None,
             muted: false,
+            group: false,
+            host_call: 0.0,
+            group_id_str: String::new(),
+            group_id: 0.0,
+            title: String::new(),
+            max_users: 8.0,
+            invited: Vec::new(),
+            invite_partners: None,
+            members: Vec::new(),
+            ping_ms: 9000.0,
+            answered: false,
+            ping_deadline: None,
+            greeted: Vec::new(),
+            members_key: String::new(),
+            has_status_text: false,
+            status_text: String::new(),
+            camera_on: None,
+            ring_deadline: None,
         };
         let peer_name = call.peer_name.clone();
         let avatar = call.avatar.clone();
@@ -720,6 +913,9 @@ impl<M: Media> Engine<M> {
     }
 
     fn finish(&mut self, now: f64, status: i64, close_code: &str, emit_signals: bool) -> Vec<Out> {
+        if self.call.as_ref().is_some_and(|c| c.group) {
+            return self.group_finish(now, status, close_code, emit_signals);
+        }
         let (call_id, peer_id, was_connected, has_session, started_at, role_caller) = {
             let Some(call) = &self.call else { return vec![] };
             if call.state == State::Ended {

@@ -14,6 +14,16 @@ if ! pkg-config --exists webkit2gtk-4.1; then
   echo "thiếu webkit2gtk-4.1 (dev). Cài: sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev" >&2
   exit 1
 fi
+# Audio engine (zrtc): cpal cần libasound2-dev, opus cần libopus-dev. Runtime
+# libs (libopus.so.0 / libasound) sẽ được linuxdeploy bundle vào AppImage.
+if ! pkg-config --exists alsa; then
+  echo "thiếu ALSA (dev) cho audio engine. Cài: sudo apt install libasound2-dev" >&2
+  exit 1
+fi
+if ! pkg-config --exists opus; then
+  echo "thiếu libopus (dev) cho audio engine. Cài: sudo apt install libopus-dev" >&2
+  exit 1
+fi
 
 # TLS/HTTP-2 fingerprint sidecar (shared Go helper, built for linux/amd64).
 # tauri.conf.json lists it under `externalBin`, so it lands in the AppImage as

@@ -18,7 +18,7 @@ pub mod msg_type {
     pub const AUDIO_FEC: i32 = 0x05;
     pub const AUDIO_RTCP: i32 = 0x07;
     pub const VIDEO_RTP: i32 = 0x0d;
-    pub const VIDEO_DOWN: i32 = 0x0e;
+    pub const VIDEO_RTP_DOWN: i32 = 0x0e;
     pub const VIDEO_FEC: i32 = 0x0f;
     pub const P2P_EXT: i32 = 0x7f;
 }
@@ -401,7 +401,7 @@ pub fn unwrap_packet(buf: &[u8]) -> Option<Unwrapped> {
         return None;
     }
     let mut p = Unwrapped { msg_type: i32::from(buf[0]), ..Default::default() };
-    if p.msg_type == msg_type::AUDIO_RTP_DOWN || p.msg_type == msg_type::VIDEO_DOWN {
+    if p.msg_type == msg_type::AUDIO_RTP_DOWN || p.msg_type == msg_type::VIDEO_RTP_DOWN {
         p.is_media = true;
         p.payload = buf[1..].to_vec();
         return Some(p);
@@ -477,7 +477,7 @@ pub fn unwrapped_json(p: &Unwrapped) -> Value {
             o["raw"] = hex_obj(&p.raw);
             return o;
         }
-        if p.msg_type != msg_type::AUDIO_RTP_DOWN && p.msg_type != msg_type::VIDEO_DOWN {
+        if p.msg_type != msg_type::AUDIO_RTP_DOWN && p.msg_type != msg_type::VIDEO_RTP_DOWN {
             o["token"] = json!(p.token);
         }
         o["payload"] = hex_obj(&p.payload);

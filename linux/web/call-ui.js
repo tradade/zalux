@@ -296,6 +296,19 @@
       info.appendChild(caller);
     }
     banner.appendChild(info);
+    // zrtc engine mode: nhận máy thật (402 + media). Ở virtual mode channel
+    // này không có ai xử lý nên nút là no-op vô hại.
+    const accept = document.createElement('button');
+    accept.className = 'olaz-call-open';
+    accept.style.background = '#2e9e4f';
+    accept.textContent = 'Trả lời';
+    accept.addEventListener('click', () => {
+      hideBanner();
+      try {
+        window.webkit?.messageHandlers?.zbridge?.postMessage({ kind: 'send', channel: 'call-accept', args: [] });
+      } catch {}
+    });
+    banner.appendChild(accept);
     // Helper nội bộ (virtual mode) có thể từ chối thật: gửi signal 405/12437
     // qua bridge — renderer relay lên server như helper macOS đã làm.
     const decline = document.createElement('button');
@@ -331,4 +344,105 @@
   };
 
   window.__olazCallUI = { openPicker, closePicker, showBanner, hideBanner, toast };
+
+  // ------------------------------------------------------------------ in-call panel
+  // zrtc engine mode: trạng thái cuộc gọi đi qua channel `call-ui`
+  // (callState {state} và UiStatus {status}); renderer nhận call-update
+  // riêng, panel này chỉ là lớp hiển thị.
+  let callPanel = null;
+  let callTimerInterval = null;
+  let callConnectedAt = null;
+
+  const fmtDuration = (ms) => {
+    const s = Math.floor(ms / 1000);
+    const mm = String(Math.floor(s / 60)).padStart(2, '0');
+    const ss = String(s % 60).padStart(2, '0');
+    return `${mm}:${ss}`;
+  };
+
+  const hideCallPanel = () => {
+    clearInterval(callTimerInterval);
+    callTimerInterval = null;
+    callConnectedAt = null;
+    callPanel?.remove();
+    callPanel = null;
+  };
+
+  const showCallPanel = (statusText) => {
+    if (!callPanel) {
+      callPanel = document.createElement('div');
+      callPanel.className = 'olaz-call-banner';
+      callPanel.style.top = 'auto';
+      callPanel.style.bottom = '18px';
+      const info = document.createElement('div');
+      info.className = 'olaz-call-info';
+      const status = document.createElement('div');
+      status.className = 'olaz-call-title';
+      status.textContent = statusText || '';
+      info.appendChild(status);
+      const clock = document.createElement('div');
+      clock.className = 'olaz-call-label';
+      info.appendChild(clock);
+      callPanel.appendChild(info);
+      const end = document.createElement('button');
+      end.className = 'olaz-call-open';
+      end.style.background = '#d64545';
+      end.textContent = 'Kết thúc';
+      end.addEventListener('click', () => {
+        try {
+          window.webkit?.messageHandlers?.zbridge?.postMessage({ kind: 'send', channel: 'call-control', args: [{ action: 'end' }] });
+        } catch {}
+        hideCallPanel();
+      });
+      callPanel.appendChild(end);
+      document.body.appendChild(callPanel);
+    }
+    const status = callPanel.querySelector('.olaz-call-title');
+    if (status && statusText) status.textContent = statusText;
+  };
+
+  const startClock = () => {
+    if (callTimerInterval) return;
+    callConnectedAt = Date.now();
+    callTimerInterval = setInterval(() => {
+      const clock = callPanel?.querySelector('.olaz-call-label');
+      if (clock && callConnectedAt) clock.textContent = fmtDuration(Date.now() - callConnectedAt);
+    }, 1000);
+  };
+
+  const onCallUi = (data) => {
+    if (!data || typeof data !== 'object') return;
+    if (data.state === 'free') return hideCallPanel();
+    if (data.state === 'incall') return; // banner đã hiển thị từ renderer
+    if (typeof data.status === 'string') {
+      const text = {
+        connecting: 'Đang kết nối…',
+        connected: 'Đã kết nối',
+        serverUnreachable: 'Không tới được máy chủ',
+        callFailed: 'Cuộc gọi lỗi',
+        recipientDeclined: 'Người nhận từ chối',
+        recipientUnreachable: 'Người nhận không khả dụng',
+        recipientNoAnswer: 'Không ai bắt máy',
+        ringing: 'Đang reo…',
+      }[data.status] || data.status;
+      showCallPanel(text);
+      if (data.status === 'connected') startClock();
+    }
+  };
+
+  // Bọc ipcEmit để nghe channel `call-ui` (sự kiện host → page đi qua đây).
+  const hookEmit = () => {
+    const bridge = window.__zaloBridge;
+    if (!bridge || typeof bridge.ipcEmit !== 'function' || bridge.__olazCallUiHooked) return;
+    const original = bridge.ipcEmit.bind(bridge);
+    bridge.ipcEmit = (channel, args) => {
+      try {
+        if (channel === 'call-ui') onCallUi(args?.[0]);
+      } catch {}
+      return original(channel, args);
+    };
+    bridge.__olazCallUiHooked = true;
+  };
+  hookEmit();
+  setTimeout(hookEmit, 1500);
 })();

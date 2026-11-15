@@ -1870,6 +1870,16 @@ impl Bridge {
                 self.call.decline();
                 Ok(undefined())
             }
+            // Nhận cuộc gọi đến (zrtc engine mode): 402 + media.
+            "call-accept" => {
+                self.call.accept();
+                Ok(undefined())
+            }
+            // Điều khiển trong cuộc gọi (zrtc engine): {"action": "end"}.
+            "call-control" => {
+                self.call.call_control(args.first().cloned().unwrap_or(Value::Null));
+                Ok(undefined())
+            }
             other => {
                 let mut unhandled = self.unhandled.lock().unwrap();
                 let count = unhandled.entry(format!("ipc:{other}")).or_insert(0);
