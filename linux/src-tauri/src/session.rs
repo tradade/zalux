@@ -130,21 +130,33 @@ pub fn load_cookie_log(cookie_file: &std::path::Path, encrypted_file: &std::path
     let Some(key) = machine_key() else {
         return std::fs::read(cookie_file).ok().and_then(|b| parse_log(&b)).unwrap_or_default();
     };
+    let mut log = Vec::new();
     if let Ok(data) = std::fs::read(encrypted_file) {
         if let Some(plain) = decrypt(&key, &data) {
-            if let Some(log) = parse_log(&plain) {
-                return log;
+            if let Some(parsed) = parse_log(&plain) {
+                log = parsed;
             }
         }
     }
-    // Legacy import: the plaintext file the previous versions wrote.
-    if let Ok(bytes) = std::fs::read(cookie_file) {
-        if let Some(log) = parse_log(&bytes) {
-            save_cookie_log(encrypted_file, cookie_file, &log);
-            return log;
+    // Bản build cũ (chưa có cơ chế enc) chỉ đọc/ghi `cookies.json` — khi hai
+    // phiên bản thay nhau chạy trên cùng userdata, enc có thể thiếu phiên
+    // đăng nhập mà json (mới hơn) vẫn giữ. Log enc không có `zpw_sek` mà json
+    // có → ưu tiên json (import lại, re-seal).
+    let has_session = log.iter().any(|(_, cookie)| cookie.starts_with("zpw_sek="));
+    if !has_session {
+        if let Ok(bytes) = std::fs::read(cookie_file) {
+            if let Some(json_log) = parse_log(&bytes) {
+                let json_has_session = json_log.iter().any(|(_, cookie)| cookie.starts_with("zpw_sek="));
+                if json_has_session || log.is_empty() {
+                    if !json_log.is_empty() {
+                        save_cookie_log(encrypted_file, cookie_file, &json_log);
+                    }
+                    return json_log;
+                }
+            }
         }
     }
-    Vec::new()
+    log
 }
 
 /// Seals and writes the cookie log (atomic rename, file 0600 — session
@@ -169,8 +181,13 @@ pub fn save_cookie_log(encrypted_file: &std::path::Path, cookie_file: &std::path
             }
             if options.open(&tmp).and_then(|mut f| std::io::Write::write_all(&mut f, &sealed)).is_ok() {
                 let _ = std::fs::rename(&tmp, encrypted_file);
-                // The plaintext copy of the same secrets must not survive.
-                let _ = std::fs::remove_file(cookie_file);
+                // Cũng giữ bản plaintext cho binary CŨ (bản CI chưa có cơ chế
+                // enc) — hai định dạng cùng tồn tại trên cùng userdata, nếu không
+                // bản cũ mở lên mất hẳn phiên đăng nhập.
+                let plain_tmp = cookie_file.with_extension("json.tmp");
+                if std::fs::write(&plain_tmp, &plain).is_ok() {
+                    let _ = std::fs::rename(&plain_tmp, cookie_file);
+                }
             }
         }
         None => {

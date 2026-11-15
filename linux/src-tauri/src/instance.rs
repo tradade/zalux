@@ -128,6 +128,14 @@ fn ask_replace_dialog(old_pid: u32) -> bool {
     dialog.add_button("Huỷ", gtk::ResponseType::Cancel);
     dialog.add_button("Đóng phiên cũ & mở mới", gtk::ResponseType::Ok);
     dialog.set_default_response(gtk::ResponseType::Ok);
+    // Tạm thời để kiểm thử: tự trả lời sau 2s như người dùng bấm nút.
+    if std::env::var("OLAZ_AUTO_CONFIRM").map(|v| v == "1").unwrap_or(false) {
+        let d = dialog.clone();
+        gtk::glib::timeout_add_local(std::time::Duration::from_millis(2000), move || {
+            d.response(gtk::ResponseType::Ok);
+            gtk::glib::ControlFlow::Break
+        });
+    }
     let replace = dialog.run() == gtk::ResponseType::Ok;
     dialog.close();
     drop(dialog);

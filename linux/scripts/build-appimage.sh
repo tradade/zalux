@@ -25,6 +25,20 @@ if [[ "$*" != *--bundles* ]]; then
   set -- --bundles "appimage,deb" "$@"
 fi
 
+# Phiên bản package theo tag release (linux-v1.0.8 → 1.0.8) — tên file
+# AppImage/.deb và metadata theo đó. CI đặt sẵn APP_RELEASE_TAG; chạy tay thì
+# lấy tag git gần nhất, không có tag thì về phiên bản trong Cargo.toml.
+version="${APP_RELEASE_TAG:-}"
+if [[ -z "$version" ]]; then
+  version="$(git describe --tags --match 'linux-v*' --abbrev=0 2>/dev/null || true)"
+fi
+version="${version#linux-v}"
+if [[ -z "$version" ]]; then
+  version="$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)"
+fi
+echo ">> build Olaz version $version"
+config_json="{\"version\":\"$version\"}"
+
 exec npx --yes @tauri-apps/cli@2 build \
-  --config src-tauri/tauri.conf.json \
+  --config "$config_json" \
   "$@"

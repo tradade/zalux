@@ -16,6 +16,7 @@ mod runtime;
 mod search_index;
 mod session;
 mod update;
+mod zrtc;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,7 +168,7 @@ fn main() {
             if use_custom_ua {
                 main_window = main_window.user_agent(user_agent);
             }
-            main_window
+            let main_window_app = main_window
                 .initialization_script(&script)
                 .on_new_window(move |url, features| {
                     let raw = url.as_str();
@@ -229,6 +230,16 @@ fn main() {
                     tauri::webview::NewWindowResponse::Deny
                 })
                 .build()?;
+            eprintln!(
+                "[olaz] main window: visible={:?} minimized={:?}",
+                main_window_app.is_visible().ok(),
+                main_window_app.is_minimized().ok()
+            );
+            // Cửa sổ chính luôn hiện diện sau boot: replace-instance hoặc khởi
+            // động từ GUI không được để lại app chỉ có icon tray.
+            let _ = main_window_app.show();
+            let _ = main_window_app.unminimize();
+            let _ = main_window_app.set_focus();
             // `window.open` từ script (không user gesture) mặc định bị WebKitGTK
             // chặn — media viewer mở popup trong hiệu ứng React sau click, nên
             // cần bật JavaScript-can-open-windows-automatically cho mọi webview.
