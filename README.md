@@ -30,6 +30,15 @@ viết bằng Swift (xem [`README-macOS.md`](README-macOS.md)). Repo này là b�
   tự thay file và khởi động lại, skip được từng phiên (macOS chỉ tự cập nhật runtime Zalo).
 - **Call dạng virtual helper**: không cần binary Qt — từ chối cuộc gọi đến (signal 405/12437),
   picker nhóm là overlay HTML trong trang, banner gọi đến; macOS dùng cửa sổ native của `ZaloCall`.
+- **Lưu phiên đăng nhập mã hoá**: cookie phiên nằm trong `cookies.enc` — AES-256-GCM với khoá bắm
+  máy (HKDF từ `/etc/machine-id`), file 0600; chép sang máy khác không đọc được. Lần chạy đầu trên
+  bản mới tự chuyển từ `cookies.json` plaintext sang bản mã hoá rồi xoá bản cũ.
+- **Tìm tin nhắn offline**: index FTS5 riêng (`search.db`) tự nạp theo tin nhắn trang đã load,
+  tokenizer bỏ dấu tiếng Việt — "xin chao" ra "xin chào", "don" ra "đơn" — tìm cả khi offline,
+  giữ nguyên sau khi khởi động lại; API `GET /__olaz/search` sẵn sàng cho UI kế tiếp.
+- **Thông báo lỗi thân thiện**: lỗi cài runtime và lỗi bridge được phân loại thành gợi ý tiếng Việt
+  (máy chủ từ chối, không kết nối được, thiếu 7z, sai SHA-256, …) trên trang chẩn đoán, kèm dòng
+  "Chi tiết" giữ nguyên lỗi gốc để debug.
 - Đóng gói **AppImage + .deb** với release workflow tự động (tag `linux-v*`), status page lần chạy
   đầu, dev harness mở rộng (eval renderer từ CLI, route điều khiển sync).
 
@@ -261,9 +270,25 @@ APPIMAGE_EXTRACT_AND_RUN=1 OLAZ_ASAR=/path/app.asar linux/dist/Olaz_1.0.0_amd64.
 * fs sync + async (stat/mkdir/readdir/unlink/access/copy/remove/rename), `getPath` theo XDG
 * `zsafe-storage` (AES-256-CBC + IV cố định như preload) và `zprotocol` (HKDF-SHA256 → AES-CBC + HMAC)
 * cookie jar dùng chung giữa `setAppCookie` và proxy mạng; UA `ZaloPC-darwin-23v<version>`
-* đăng nhập QR đã chạy với tài khoản thật. Cookie phiên (`zpw_sek`, …) được lưu ở
-  `cookies.json` trong userdata và nạp lại khi khởi động: có phiên thì cửa sổ vào thẳng
+* đăng nhập QR đã chạy với tài khoản thật. Cookie phiên (`zpw_sek`, …) được lưu mã hoá ở
+  `cookies.enc` trong userdata và nạp lại khi khởi động: có phiên thì cửa sổ vào thẳng
   `index.html?…&already_login=y`, không có thì mở trang QR
+* **phiên đăng nhập mã hoá**: `cookies.enc` — AES-256-GCM (`session.rs`), key là HKDF-SHA256 của
+  `/etc/machine-id` (bắm máy: file copy sang máy khác không mở được; máy không có machine-id
+  giữ nguyên file plaintext như cũ), AAD = magic+version, nonce ngẫu nhiên mỗi lần ghi, file 0600,
+  ghi atomic rename. Bản `cookies.json` plaintext của bản cũ được nhập một lần (nạp → seal → xoá)
+* **tìm tin nhắn offline** (`search_index.rs`): SQLite FTS5 riêng ở `<userdata>/search.db`
+  (`unicode61 remove_diacritics 2` + trigger external-content), không đụng IndexedDB của renderer.
+  Nguồn cấp là chính các post `chat` của `chat-adapter.js` qua `/bridge/zstate` — tin nhắn hội thoại
+  đang mở được index tự động, không cần JS thêm. Token gõ thành prefix-term nối AND; chữ `đ`/`Đ`
+  được fold về `d` cả hai phía (tokenizer không fold stroke), "don" khớp "đơn" và ngược lại. Upsert
+  theo `msg_id` (không trùng), xoá khi recall. Tra cứu: `GET /__olaz/search?q=&conv=&limit=` trả hits
+  với `snippet()`; nạp thủ công: `POST /__olaz/search-index`
+* **catalog lỗi** (`error_catalog.rs`): `describe_api`/`describe_transport` phân loại lỗi native
+  (mã HTTP, DNS, kết nối, TLS, giải nén 7z, sai SHA-256, hết đĩa) thành gợi ý tiếng Việt; mã `-20`
+  của QR long-poll được phân loại đúng là "cần quét QR thứ hai", không phải lỗi. Lỗi bridge trả kèm
+  field `hint` (additive, không đổi contract của `error`); trạng thái cài runtime lỗi thêm `hint` và
+  trang chẩn đoán hiển thị gợi ý ở dòng đầu, giữ lỗi gốc ở dòng "Chi tiết"
 * dung lượng ổ đĩa lấy từ `statvfs` thật qua `$znode.nativelibs.fileUtils().getDiskUsage` và
   `$znode.diskSpace` (trước đây chưa cài nên trả `undefined` → Zalo báo "đầy ổ cứng" dù còn trống)
 * URL trang renderer mang `?type=23&client_version=<runtime>&app_version=…&fail_sqlite3=true` như

@@ -7,11 +7,14 @@ mod asar;
 mod bridge;
 mod call;
 mod download;
+mod error_catalog;
 mod fingerprint;
 mod host;
 mod instance;
 mod net;
 mod runtime;
+mod search_index;
+mod session;
 mod update;
 
 use std::sync::Arc;

@@ -38,6 +38,10 @@ pub struct AppContext {
     dev_eval_waiters: Mutex<HashMap<u64, mpsc::Sender<String>>>,
     /// First-run installer state, shown on `/__olaz/index.html`.
     pub runtime: Arc<Mutex<RuntimeState>>,
+    /// Sidecar FTS5 index of loaded messages (`search_index.rs`), with its
+    /// async feed — the zstate handler only enqueues, never touches SQLite.
+    pub search: Arc<crate::search_index::SearchIndex>,
+    pub search_feed: crate::search_index::SearchFeed,
     port: AtomicU16,
     aux_port: AtomicU16,
     /// The whole injected bundle (shim + spec + host scripts), served as
@@ -69,7 +73,7 @@ impl RuntimeState {
             }
             RuntimeState::Ready(version) => json!({ "state": "ready", "version": version, "message": "" }),
             RuntimeState::Failed(message, list) => {
-                json!({ "state": "failed", "message": message, "checks": checks(list) })
+                json!({ "state": "failed", "message": message, "hint": crate::error_catalog::describe_transport(message).user_message, "checks": checks(list) })
             }
         }
     }
@@ -244,6 +248,8 @@ impl AppContext {
         let events = Arc::new(Events::new());
         let bridge = Bridge::new(userdata.clone(), client_version, debug, events.clone());
         bridge.set_app_version(&app_version);
+        let search = Arc::new(crate::search_index::SearchIndex::new(userdata.clone()));
+        let search_feed = crate::search_index::SearchFeed::spawn(search.clone());
         Ok(Self {
             asar: Mutex::new(asar),
             userdata,
@@ -254,6 +260,8 @@ impl AppContext {
             dev_eval_seq: AtomicU64::new(0),
             dev_eval_waiters: Mutex::new(HashMap::new()),
             runtime: Arc::new(Mutex::new(runtime_state)),
+            search,
+            search_feed,
             port: AtomicU16::new(0),
             aux_port: AtomicU16::new(0),
             boot: Mutex::new(String::new()),
@@ -1060,6 +1068,46 @@ fn handle(ctx: &Arc<AppContext>, mut request: Request) {
             let state = ctx.runtime.lock().unwrap().json();
             reply(request, 200, "application/json", state.to_string());
         }
+        // Search index feed: `web/olaz-linux.js` batches the messages the page
+        // loaded per conversation. Never blocks the page on errors — a failed
+        // index update just means those messages are not searchable.
+        (Method::Post, "/__olaz/search-index") => {
+            let body = match json_body() {
+                Ok(value) => value,
+                Err(error) => {
+                    reply(request, 400, "application/json", json!({ "ok": false, "error": error }).to_string());
+                    return;
+                }
+            };
+            let conv = body.get("convId").and_then(|v| v.as_str()).unwrap_or_default();
+            if conv.is_empty() {
+                reply(request, 400, "application/json", json!({ "ok": false, "error": "thiếu convId" }).to_string());
+                return;
+            }
+            let upserted = body.get("upserted").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let removed = body
+                .get("removed")
+                .and_then(|v| v.as_array())
+                .map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>())
+                .unwrap_or_default();
+            match ctx.search.update(conv, &upserted, &removed) {
+                Ok(()) => reply(request, 200, "application/json", json!({ "ok": true }).to_string()),
+                Err(error) => {
+                    eprintln!("[olaz] search-index: {error}");
+                    reply(request, 200, "application/json", json!({ "ok": false, "error": error }).to_string())
+                }
+            }
+        }
+        (Method::Get, p) if p.starts_with("/__olaz/search") => {
+            let text = param(&query, "q").unwrap_or_default();
+            let text = percent_encoding::percent_decode_str(&text).decode_utf8_lossy().into_owned();
+            let conv = param(&query, "conv").map(|v| percent_encoding::percent_decode_str(&v).decode_utf8_lossy().into_owned());
+            let limit = param(&query, "limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(50).min(200);
+            match ctx.search.search(&text, conv.as_deref(), limit) {
+                Ok(result) => reply(request, 200, "application/json", result.to_string()),
+                Err(error) => reply(request, 500, "application/json", json!({ "error": error }).to_string()),
+            }
+        }
         (Method::Get, "/__olaz/fetch-runtime") | (Method::Post, "/__olaz/fetch-runtime") => {
             install_in_background(ctx.clone(), "yêu cầu từ trang chẩn đoán".to_string());
             let state = ctx.runtime.lock().unwrap().json();
@@ -1310,7 +1358,12 @@ return JSON.stringify({ cancelled: true, running: m2.isSyncRunning() });
             match handler {
                 "zbridge" => match ctx.bridge.dispatch(&payload, &window) {
                     Ok(value) => reply(request, 200, "application/json", json!({ "ok": true, "value": value }).to_string()),
-                    Err(error) => reply(request, 200, "application/json", json!({ "ok": false, "error": error }).to_string()),
+                    Err(error) => {
+                        // The raw text stays the contract (the page matches some
+                        // shapes); `hint` is additive for UIs that want a friendly line.
+                        let hint = crate::error_catalog::describe_transport(&error).user_message;
+                        reply(request, 200, "application/json", json!({ "ok": false, "error": error, "hint": hint }).to_string())
+                    }
                 },
                 "znet" => {
                     let value = match payload.get("op").and_then(|v| v.as_str()) {
@@ -1348,6 +1401,7 @@ return JSON.stringify({ cancelled: true, running: m2.isSyncRunning() });
                         eprintln!("[state] {}", truncate(&payload.to_string(), 400));
                     }
                     handle_call_state(ctx, &payload);
+                    handle_search_state(ctx, &payload);
                     // The notification shim reports readiness and asks for the
                     // permission the way it expects the native host to answer
                     // (macOS: UNUserNotificationCenter). Grant it immediately —
@@ -1385,6 +1439,50 @@ fn truncate(text: &str, limit: usize) -> String {
         return text.to_string();
     }
     text.chars().take(limit).collect::<String>() + "…"
+}
+
+/// Search-index feed: the chat-state posts (`chat-adapter.js`) carry the
+/// loaded / changed messages of the open conversation — map them to index rows
+/// (best effort; a failure here only means those messages are not searchable).
+fn handle_search_state(ctx: &Arc<AppContext>, payload: &Value) {
+    let Some(chat) = payload.get("chat") else { return };
+    let Some(conv) = chat.get("convId").and_then(Value::as_str) else { return };
+    let upserted = chat.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+    let removed: Vec<String> = chat
+        .get("removed")
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    // ChatMessageJSON → index row. Skip messages without readable text and the
+    // centered kinds (notice / recall / system) that carry no content of their own.
+    let rows: Vec<Value> = upserted
+        .iter()
+        .filter_map(|message| {
+            let id = message.get("id").and_then(Value::as_str)?;
+            let text = message.get("text").and_then(Value::as_str).unwrap_or_default();
+            if id.is_empty() || text.trim().is_empty() {
+                return None;
+            }
+            let kind = message.get("kind").and_then(|k| k.get("type")).and_then(Value::as_str).unwrap_or("other");
+            if matches!(kind, "notice" | "recalled" | "system" | "placeholder") {
+                return None;
+            }
+            Some(json!({
+                "id": id,
+                "senderId": message.get("senderId").and_then(Value::as_str).unwrap_or_default(),
+                "senderName": message.get("senderName").and_then(Value::as_str).unwrap_or_default(),
+                "ts": message.get("date").and_then(Value::as_f64).unwrap_or(0.0) as i64,
+                "isMine": message.get("isMine").and_then(Value::as_bool).unwrap_or(false),
+                "text": text,
+                "type": kind,
+            }))
+        })
+        .collect();
+    if rows.is_empty() && removed.is_empty() {
+        return;
+    }
+    // Enqueue only: the worker thread owns all SQLite work (see `SearchFeed`).
+    ctx.search_feed.feed(conv, rows, removed);
 }
 
 /// Sự kiện call của `call-adapter.js` (zcall-v2, qua `zstate`): gọi đến báo qua
@@ -2265,8 +2363,11 @@ async function showRuntime() {
   }
   fetchStarted = 0;
   const failed = status.state === 'failed';
-  rt.innerHTML = (failed ? '<span class="bad">✗</span> cài đặt lỗi: ' : '<span class="bad">✗</span> chưa có runtime: ') +
-    esc(status.message || 'chưa rõ lý do') + checksHtml(status.checks) +
+  // `hint` is the catalog's friendly line (error_catalog.rs); `message` keeps the raw text — this is a diagnostics page.
+  const headline = failed ? 'cài đặt lỗi: ' : 'chưa có runtime: ';
+  const hint = failed && status.hint ? '<div>' + esc(status.hint) + '</div>' : '';
+  const detail = status.message ? '<div class="muted">Chi tiết: ' + esc(status.message) + '</div>' : '';
+  rt.innerHTML = '<span class="bad">✗</span> ' + headline + hint + detail + checksHtml(status.checks) +
     '<div class="muted">Bản macOS cũng tự tải Zalo PC ở lần chạy đầu. Ở đây cài bằng nút dưới, ' +
     'hoặc <code>OLAZ_ASAR=/đường/dẫn/app.asar</code>, hoặc <code>olaz-linux --fetch-runtime</code> trong terminal. ' +
     'Giải nén cần <code>p7zip-full</code>.</div>';

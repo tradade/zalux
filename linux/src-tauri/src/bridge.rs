@@ -242,20 +242,8 @@ pub struct Bridge {
 impl Bridge {
     pub fn new(userdata: PathBuf, client_version: String, debug: bool, events: Arc<Events>) -> Self {
         let cookie_file = userdata.join("cookies.json");
-        let cookie_log: Vec<(String, String)> = std::fs::read(&cookie_file)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).ok())
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .filter_map(|entry| {
-                        let url = entry.get("url")?.as_str()?.to_string();
-                        let cookie = entry.get("cookie")?.as_str()?.to_string();
-                        Some((url, cookie))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let encrypted_file = userdata.join("cookies.enc");
+        let cookie_log: Vec<(String, String)> = crate::session::load_cookie_log(&cookie_file, &encrypted_file);
         let jar = reqwest::cookie::Jar::default();
         for (url, cookie) in &cookie_log {
             if let Ok(parsed) = reqwest::Url::parse(url) {
@@ -427,8 +415,9 @@ impl Bridge {
         }
     }
 
-    /// Writes the cookie back to `cookies.json` (atomic rename) so the next launch
-    /// starts logged in. One entry per (url, name): later values replace earlier ones.
+    /// Seals the cookie into `cookies.enc` (atomic rename) so the next launch
+    /// starts logged in — machine-bound AES-256-GCM, see `session.rs`. One
+    /// entry per (url, name): later values replace earlier ones.
     fn remember_cookie(&self, url: &str, cookie: &str) {
         let name = cookie.split('=').next().unwrap_or_default().trim().to_string();
         if name.is_empty() {
@@ -438,9 +427,10 @@ impl Bridge {
             .ok()
             .and_then(|u| u.host_str().map(str::to_string))
             .unwrap_or_default();
+        // The whole update (dedup + push + file write) holds the lock: two
+        // concurrent Set-Cookie replies must land in file order, never as a
+        // stale snapshot overwriting a newer one.
         let mut log = self.cookie_log.lock().unwrap();
-        // One entry per host+name: the same cookie arrives for many request paths and
-        // re-logins, which otherwise grows the file with stale duplicates.
         log.retain(|(saved_url, saved)| {
             let saved_host = reqwest::Url::parse(saved_url)
                 .ok()
@@ -450,14 +440,7 @@ impl Bridge {
             !(saved_host == host && saved_name == name)
         });
         log.push((url.to_string(), cookie.to_string()));
-        let payload: Vec<Value> = log
-            .iter()
-            .map(|(url, cookie)| json!({ "url": url, "cookie": cookie }))
-            .collect();
-        let tmp = self.cookie_file.with_extension("json.tmp");
-        if std::fs::write(&tmp, serde_json::to_vec_pretty(&payload).unwrap_or_default()).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.cookie_file);
-        }
+        crate::session::save_cookie_log(&self.cookie_file.with_extension("enc"), &self.cookie_file, &log);
     }
 
     /// True once `zpw_sek` was set by a completed QR login — the same test main
