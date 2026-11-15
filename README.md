@@ -30,6 +30,13 @@ viết bằng Swift (xem [`README-macOS.md`](README-macOS.md)). Repo này là b�
   tự thay file và khởi động lại, skip được từng phiên (macOS chỉ tự cập nhật runtime Zalo).
 - **Call dạng virtual helper**: không cần binary Qt — từ chối cuộc gọi đến (signal 405/12437),
   picker nhóm là overlay HTML trong trang, banner gọi đến; macOS dùng cửa sổ native của `ZaloCall`.
+- **Call engine zrtc (`OLAZ_CALL_ENGINE=zrtc`)**: nhận máy thật — media stack riêng thay binary
+  Qt của helper: đăng ký relay (InitZRTP 4 layout probe), SRTP (khoá từ `sessId`, nhóm từ
+  `zrtc_config.srtpKey`, thiếu → plain RTP), Opus 16 kHz VoIP 32 kbps + inband FEC, jitter buffer
+  thích ứng + PLC, TWCC/SR/RR/PLI/NACK, mix audio nhóm, video H.264 (PT 97/98, SPS/PPS re-inject,
+  keyframe gate). Signalling đầy đủ: 1-1 (401/402/405-409/416) và nhóm (12433-12439, 12445-12447,
+  12097/12098) — nhận máy, gọi ra, từ chối, kết thúc, roster nhóm tự reconcile. Audio device qua
+  cpal/ALSA; codec/demouflage H.264 sẵn sàng nhưng render cần OpenH264 (chưa bundle).
 - **Lưu phiên đăng nhập mã hoá**: cookie phiên nằm trong `cookies.enc` — AES-256-GCM với khoá bắm
   máy (HKDF từ `/etc/machine-id`), file 0600; chép sang máy khác không đọc được. Lần chạy đầu trên
   bản mới tự chuyển từ `cookies.json` plaintext sang bản mã hoá rồi xoá bản cũ.
@@ -42,7 +49,8 @@ viết bằng Swift (xem [`README-macOS.md`](README-macOS.md)). Repo này là b�
 - Đóng gói **AppImage + .deb** với release workflow tự động (tag `linux-v*`), status page lần chạy
   đầu, dev harness mở rộng (eval renderer từ CLI, route điều khiển sync).
 
-**Bản macOS có mà Linux chưa có**: cửa sổ gọi thoại/video với mic/camera (cần RE engine zrtc),
+**Bản macOS có mà Linux chưa có**: cửa sổ gọi thoại/video với mic/camera (engine zrtc đã có trên
+Linux qua `OLAZ_CALL_ENGINE=zrtc` nhưng render video cần OpenH264 và chưa có cửa sổ gọi riêng),
 `ZaloCap` chụp màn hình, transform E2EE khi upload file, de-noise media, SQLCipher database.
 
 > **Unofficial project, không liên quan tới VNG.** "Zalo" là thương hiệu của VNG. Dự án thuộc nhóm
@@ -206,6 +214,7 @@ mở nên không có việc đổi fingerprint giữa phiên.
 | `OLAZ_FINGERPRINT_HELPER` | đường dẫn helper, nếu nó không nằm cạnh binary |
 | `OLAZ_DUMP=1` | in 3000 ký tự đầu body của các endpoint `/api/login/*` và `qr-id.*` (xem server trả gì khi QR bị từ chối) |
 | `OLAZ_CALL_HELPER` | binary helper gọi (`ZaloCall`) ngoài virtual helper; `virtual` (mặc định) / `none` / đường dẫn |
+| `OLAZ_CALL_ENGINE=zrtc` | bật **call engine zrtc**: nhận máy thật (402 + media), thoại 1-1 và nhóm, audio cpal/ALSA — mặc định tắt (virtual helper chỉ từ chối) |
 | `OLAZ_REPLACE_INSTANCE=1` | bỏ qua dialog single-instance, tự đóng phiên cũ và mở mới |
 | `OLAZ_WEBVIEW_UA` | ghi đè UA webview (mặc định Chromium 108 để renderer đi đúng nhánh mở link; `default` = UA WebKitGTK gốc) |
 
@@ -289,6 +298,27 @@ APPIMAGE_EXTRACT_AND_RUN=1 OLAZ_ASAR=/path/app.asar linux/dist/Olaz_1.0.0_amd64.
   của QR long-poll được phân loại đúng là "cần quét QR thứ hai", không phải lỗi. Lỗi bridge trả kèm
   field `hint` (additive, không đổi contract của `error`); trạng thái cài runtime lỗi thêm `hint` và
   trang chẩn đoán hiển thị gợi ý ở dòng đầu, giữ lỗi gốc ở dòng "Chi tiết"
+* **call engine zrtc** (`zrtc/` — bật bằng `OLAZ_CALL_ENGINE=zrtc`, mặc định vẫn virtual helper):
+  media stack hoàn chỉnh thay binary Qt của helper —
+  * **wire** (`wire.rs`): media wrapper `[msgType][token LE32]`, control header 21 byte,
+    `u16String` LE, InitZRTP đăng ký relay (1-1: cmd 11/12; nhóm: 4 layout probe
+    zero→sub6→callId→callIdHost), Ping/ZaviPing/EndCall/ReqForward/RoomUpdated, P2P framing 0x7f —
+    mọi layout được pin bằng golden vectors
+  * **SRTP** (`srtp.rs`): khoá = 30 byte đầu `sessId` (nhóm: `zrtc_config.srtpKey`), KDF chuẩn
+    AES-CM, AES-128-CTR + HMAC-SHA1-80 + ROC per-SSRC; nhóm thiếu khoá → plain RTP
+  * **RTP/RTCP** (`rtp.rs`/`rtcp.rs`): audio PT 112 (TWCC ext), video PT 97/98 (FU-A ≤1068 B,
+    SPS/PPS re-inject, keyframe gate), TWCC 50 ms, SR/RR+SDES 1 s, PLI rate-limit, NACK tracker,
+    RTCP đi qua message type FEC (0x05/0x0f)
+  * **máy trạng thái** (`engine.rs`/`group.rs`): 1-1 (401→416→ring→answer→408→405/409→406) và
+    nhóm (12433→12434→12436→12437/12438/12446, roster `RoomUpdated` reconcile, ping theo
+    `interval`, broadcast 12098, greet, auto-hangup một mình, kicked) — mọi entry nhận clock và
+    trả event, test được không cần I/O
+  * **audio** (`audio.rs`): Opus 16 kHz mono VoIP 32 kbps + inband FEC (cpal/ALSA), jitter buffer
+    thích ứng 3-10 frame + PLC, mix nhóm per-SSRC có clamp
+  * **thread model**: engine + media chạy thread riêng, HTTP handler chỉ enqueue — không bao giờ
+    chặn bridge (vite/budget 6 connection/host của WebKitGTK)
+* **video H.264** (`video.rs`): assembler FU-A + reorder + keyframe gate + `avc1.PPCCLL` — pin
+  vectors; render cần OpenH264 (chưa bundle, khi thiếu call vẫn thoại-only)
 * dung lượng ổ đĩa lấy từ `statvfs` thật qua `$znode.nativelibs.fileUtils().getDiskUsage` và
   `$znode.diskSpace` (trước đây chưa cài nên trả `undefined` → Zalo báo "đầy ổ cứng" dù còn trống)
 * URL trang renderer mang `?type=23&client_version=<runtime>&app_version=…&fail_sqlite3=true` như
@@ -360,8 +390,11 @@ Chưa có (khác bản macOS):
   adapter nuốt). **Virtual helper (mặc định)**: không có binary thì `call.rs` đóng vai helper mức UI —
   trả lời `listDevice` cho Settings, theo dõi cuộc gọi đến (`callState incall`) và cho phép **từ chối**
   bằng signal 405 (1-1) / 12437 (nhóm) qua banner in-page → renderer relay lên server như helper thật.
-  **Chưa có**: chấp nhận cuộc gọi (402 đòi media — cần engine zrtc, xem protocol đã RE trong
-  `reanalysis/bridge-spec.md` §"Renderer ↔ helper message protocol"); binary helper ngoài (nếu có, trỏ
+  **Call engine zrtc** (`OLAZ_CALL_ENGINE=zrtc`): nhận máy thật được — 402 + media stack riêng
+  (chi tiết ở mục "Đã có gì" phía trên): thoại 1-1 và nhóm, banner thêm nút "Trả lời" +
+  panel trạng thái trong trang (`call-ui.js`). **Chưa có**: render video (cần OpenH264 bundle +
+  cửa sổ gọi riêng), mute/camera trong cuộc gọi (signal 12006), share screen (12043/12044);
+  binary helper ngoài (nếu có, trỏ
   `OLAZ_CALL_HELPER=<đường dẫn>`; `OLAZ_CALL_HELPER=none` để tắt hẳn). `ZaloCap` (chụp màn hình) chưa port.
 * WebSocket realtime đi bằng tungstenite (xem mục fingerprint ở trên).
 * `$zFileManager` đã port theo bản macOS: `z_u.txt` (`getViewerkey` phải reject khi thiếu),
