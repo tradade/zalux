@@ -241,12 +241,15 @@ fn recv_signal_401_without_servers_fails() {
 }
 
 #[test]
-fn incoming_while_busy_is_ignored() {
+fn incoming_while_busy_auto_declines_new_call() {
     let mut e = engine(false);
     let now = 0.0;
     e.make_call(now, &json!({"type": 1, "partner": [{"id": "5678"}]}));
-let out = e.handle_control(now, "request", &json!({"data": {"uidN": "9999", "callId": 55, "params": {}}}));
-    assert!(out.is_empty());
+    // Đang bận: cuộc mới bị auto-decline (402 status 3), cuộc cũ nguyên vẹn.
+    let out = e.handle_control(now, "request", &json!({"data": {"uidN": "9999", "callId": 55, "params": {}}}));
+    assert_eq!(codes(&out), vec![402]);
+    assert_eq!(find_signal(&out, 402)["status"], 3);
+    assert_eq!(find_signal(&out, 402)["callId"], 55);
     assert_eq!(e.call.as_ref().unwrap().peer_id, "5678");
 }
 
@@ -290,3 +293,29 @@ fn group_call_outgoing_signals_12433() {
 }
 
 
+
+#[test]
+fn incoming_unanswered_times_out_with_405() {
+    let mut e = engine(false);
+    let now = 1_000.0;
+    e.handle_control(now, "request", &json!({"data": {"uidN": "5678", "uidFrom": 5678, "uidTo": 1234, "callId": 42, "params": {}}}));
+    assert!(e.in_call());
+    // Chưa tới 45 s: im lặng.
+    assert!(e.tick(now + 44_999.0).is_empty());
+    // Quá 45 s không ai bắt: 405 báo cho bên gọi + dọn state (banner đã ẩn).
+    let out = e.tick(now + 45_000.0);
+    assert_eq!(codes(&out), vec![405, 406]);
+    assert_eq!(find_signal(&out, 405)["callId"], 42);
+    assert!(!e.in_call());
+}
+
+#[test]
+fn incoming_retransmit_same_id_is_silent() {
+    let mut e = engine(false);
+    let now = 1_000.0;
+    e.handle_control(now, "request", &json!({"data": {"uidN": "5678", "callId": 42, "params": {}}}));
+    assert!(e.in_call());
+    // Retransmit cùng callId → bỏ qua lặng (không spam 402).
+    assert!(e.handle_control(now + 100.0, "request", &json!({"data": {"uidN": "5678", "callId": 42, "params": {}}})).is_empty());
+    assert!(matches!(&e.call, Some(c) if c.call_id == 42.0 && c.state == State::Incoming));
+}

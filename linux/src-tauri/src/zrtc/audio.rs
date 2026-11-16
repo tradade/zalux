@@ -13,6 +13,8 @@
 use opus::{Application, Channels, Decoder, Encoder};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 pub const SAMPLE_RATE: u32 = 16_000;
@@ -190,18 +192,46 @@ pub struct AudioIo {
     _output: cpal::Stream,
 }
 
+/// Mốc ms lần capture mic gần nhất (callback cpal còn sống hay không). Dùng
+/// epoch ms như `media::now_ms` để media thread so sánh trực tiếp.
+fn capture_now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
 impl AudioIo {
     /// Opens 16 kHz mono streams on the default devices. `mic` receives captured
     /// PCM, `speaker` is drained for playout. Errors name the direction.
-    pub fn open(mic: PcmRing, speaker: PcmRing) -> Result<Self, (Direction, String)> {
+    ///
+    /// `faults` nhận `Direction` khi stream chết giữa cuộc gọi (rút thiết bị,
+    /// thu hồi quyền — cpal báo qua error callback); `mic_activity` được dập
+    /// mỗi lần callback capture chạy để watchdog phát hiện callback ngừng
+    /// mà không có error (trường hợp hiếm nhưng đã gặp ngoài thực tế).
+    pub fn open(mic: PcmRing, speaker: PcmRing, faults: &mpsc::Sender<Direction>, mic_activity: &Arc<AtomicU64>) -> Result<Self, (Direction, String)> {
         let host = cpal::default_host();
         let config = cpal::StreamConfig { channels: 1, sample_rate: cpal::SampleRate(SAMPLE_RATE), buffer_size: cpal::BufferSize::Default };
         let err = |d: Direction| move |e: cpal::BuildStreamError| (d, e.to_string());
+        let mic_faults = faults.clone();
+        let mic_clock = mic_activity.clone();
         let input = host
             .default_input_device()
             .ok_or((Direction::Mic, "no input device".to_string()))
-            .and_then(|device| device.build_input_stream(&config, move |pcm: &[i16], _| mic.push(pcm), |e| eprintln!("[olaz] mic stream: {e}"), None).map_err(err(Direction::Mic)))
+            .and_then(|device| {
+                device.build_input_stream(
+                    &config,
+                    move |pcm: &[i16], _| {
+                        mic_clock.store(capture_now_ms(), Ordering::Relaxed);
+                        mic.push(pcm);
+                    },
+                    move |e| {
+                        eprintln!("[olaz] mic stream: {e}");
+                        let _ = mic_faults.send(Direction::Mic);
+                    },
+                    None,
+                )
+                .map_err(err(Direction::Mic))
+            })
             .map_err(|(d, e)| (d, e))?;
+        let spk_faults = faults.clone();
         let output = host
             .default_output_device()
             .ok_or((Direction::Speaker, "no output device".to_string()))
@@ -212,7 +242,10 @@ impl AudioIo {
                         for slot in pcm[got..].iter_mut() {
                             *slot = 0; // underrun: silence, the jitter buffer is still ramping
                         }
-                    }, |e| eprintln!("[olaz] speaker stream: {e}"), None)
+                    }, move |e| {
+                        eprintln!("[olaz] speaker stream: {e}");
+                        let _ = spk_faults.send(Direction::Speaker);
+                    }, None)
                     .map_err(err(Direction::Speaker))
             })
             .map_err(|(d, e)| (d, e))?;

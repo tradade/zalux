@@ -70,6 +70,8 @@
     .olaz-call-toast { position: fixed; left: 50%; bottom: 72px; transform: translateX(-50%); z-index: 2147483001;
       background: rgba(20,20,20,.92); color: #fff; padding: 9px 18px; border-radius: 20px; font-size: 13px;
       animation: olaz-call-in .15s ease-out; }
+    .olaz-call-video { width: 100%; max-height: 260px; object-fit: cover; border-radius: 10px;
+      margin-bottom: 8px; background: #000; display: block; }
   `;
   HOST.appendChild(style);
 
@@ -424,10 +426,28 @@
         recipientUnreachable: 'Người nhận không khả dụng',
         recipientNoAnswer: 'Không ai bắt máy',
         ringing: 'Đang reo…',
+        micUnavailable: 'Không dùng được micro — bên kia không nghe thấy bạn',
+        speakerUnavailable: 'Không phát được loa — bạn không nghe thấy bên kia',
+        audioUnavailable: 'Lỗi thiết bị âm thanh',
       }[data.status] || data.status;
       showCallPanel(text);
       if (data.status === 'connected') startClock();
     }
+  };
+
+  // Ảnh bên kia (engine gửi `call-video` ~2 fps khi peer phát video).
+  const onCallVideo = (data) => {
+    const jpeg = data && typeof data.jpeg === 'string' ? data.jpeg : '';
+    if (!jpeg) return;
+    showCallPanel();
+    let img = callPanel.querySelector('.olaz-call-video');
+    if (!img) {
+      img = document.createElement('img');
+      img.className = 'olaz-call-video';
+      img.alt = '';
+      callPanel.insertBefore(img, callPanel.firstChild);
+    }
+    img.src = `data:image/jpeg;base64,${jpeg}`;
   };
 
   // Bọc ipcEmit để nghe channel `call-ui` (sự kiện host → page đi qua đây).
@@ -438,6 +458,13 @@
     bridge.ipcEmit = (channel, args) => {
       try {
         if (channel === 'call-ui') onCallUi(args?.[0]);
+        else if (channel === 'call-video') onCallVideo(args?.[0]);
+        // Bên kia hủy / reset giữa cuộc gọi: call-update free tới nhưng banner
+        // chỉ ẩn khi bấm hoặc hết 45s — ẩn luôn ở đây.
+        else if (channel === 'call-update' && args?.[0] === 'callState' && args?.[1]?.state === 'free') {
+          hideBanner();
+          hideCallPanel();
+        }
       } catch {}
       return original(channel, args);
     };

@@ -1,8 +1,10 @@
 //! Group call state machine — the group paths of the Zalos client's
 //! `engine_core.cpp` (BSD-3-Clause), as an extension block of [`Engine`].
 //!
-//! Signalling (all relayed by the renderer): `12433` request → server answer
-//! carries session/servers/`hostCall` → `12434` join · `12436` answer
+//! Signalling (all relayed by the renderer — key sets verified against the
+//! official renderer's `call-send-signal` switch in `app.asar`): `12433`
+//! request → server answer carries session/servers/`hostCall` → `12434`
+//! request (room announce) · `12043` join (media room) · `12436` answer
 //! (status 0 join / 3 decline) · `12437` cancel · `12438` end · `12439`
 //! ring-ring · `12097` ping (every `interval`) · `12098` broadcast state ·
 //! `12446` finish log. Controls: `group_request/answer/ring_ring/broadcast/
@@ -15,6 +17,20 @@ use serde_json::{json, Map, Value};
 const GROUP_RING_TIMEOUT_MS: f64 = 60_000.0;
 const GROUP_DEFAULT_PING_MS: f64 = 10_000.0;
 const GROUP_MEDIA_IDLE_MS: f64 = 10_000.0;
+
+/// Group id số (server cấp sau 12433) hoặc chuỗi `g…` lúc mới tạo phòng.
+fn gid_json(call: &super::engine::Call) -> Value {
+    if call.group_id != 0.0 {
+        super::engine::num_json(call.group_id)
+    } else {
+        json!(call.group_id_str)
+    }
+}
+
+/// Id các thành viên đã biết (cho `partners` của 12436/12437/12438/12446).
+fn member_ids(call: &super::engine::Call) -> Vec<Value> {
+    call.members.iter().map(|(key, _)| key.to_json()).collect()
+}
 
 fn str_or(v: Option<&Value>) -> String {
     v.and_then(Value::as_str).unwrap_or_default().to_string()
@@ -201,10 +217,33 @@ impl<M: Media> Engine<M> {
     // ------------------------------------------------------------- incoming
 
     pub(crate) fn group_incoming(&mut self, now: f64, d: &Value) -> Vec<Out> {
-        if self.call.is_some() {
-            return vec![];
-        }
         let dobj = d.as_object().cloned().unwrap_or_default();
+        if self.call.is_some() {
+            // Retransmit cùng id thì bỏ qua; phòng khác tới khi đang bận thì
+            // auto-decline (12436 status 3) thay vì ghi đè cuộc hiện tại.
+            let new_id = num_of(dobj.get("id"));
+            let same = new_id != 0.0 && self.call.as_ref().is_some_and(|c| c.call_id == new_id);
+            if same || new_id == 0.0 {
+                return vec![];
+            }
+            let local = num_of(dobj.get("receiverId"));
+            let partners: Vec<Value> = dobj
+                .get("partnerInfo")
+                .and_then(Value::as_array)
+                .map(|list| list.iter().filter_map(|p| p.get("userId").and_then(Value::as_f64)).filter(|u| *u != 0.0 && *u != local).map(super::engine::num_json).collect())
+                .unwrap_or_default();
+            return vec![Out::SendSignal {
+                code: 12436,
+                data: json!({
+                    "calleeId": super::engine::num_json(local),
+                    "callId": super::engine::num_json(new_id),
+                    "callType": num_of(dobj.get("callType")),
+                    "data": {"groupId": dobj.get("groupId").cloned().unwrap_or(Value::Null), "status": 3},
+                    "hostCall": super::engine::num_json(num_of(dobj.get("hostCall"))),
+                    "partners": partners,
+                }),
+            }];
+        }
         let setting = parse_maybe_json(dobj.get("callSetting"));
         let local_uid = num_of(dobj.get("receiverId"));
         let mut members: Vec<(MemberKey, Member)> = Vec::new();
@@ -265,14 +304,21 @@ impl<M: Media> Engine<M> {
             return vec![];
         }
         self.call = Some(call);
+        // Callee không trả lời: tick tự decline (12436 status 3) sau 45 s.
+        if let Some(call) = &mut self.call {
+            call.ring_deadline = Some((now + super::engine::RING_TIMEOUT_MS, super::engine::RING_TIMEOUT_MS));
+        }
         let mut out = vec![
             Out::Update { command: "callState".into(), data: json!({"state": "incall"}) },
             Out::SendSignal {
                 code: 12439,
                 data: json!({
+                    "calleeId": super::engine::num_json(local_uid),
                     "callId": super::engine::num_json(call_id),
+                    "callType": num_of(dobj.get("callType")),
                     "data": {"callType": 1, "extraData": "", "status": 1},
                     "hostCall": super::engine::num_json(host_call),
+                    "partners": member_ids(self.call.as_ref().unwrap()),
                     "session": self.call.as_ref().unwrap().sess_id,
                     "status": 1,
                 }),
@@ -331,18 +377,22 @@ impl<M: Media> Engine<M> {
         vec![Out::SendSignal {
             code: 12436,
             data: json!({
+                "calleeId": super::engine::num_json(call.local_uid),
                 "callId": super::engine::num_json(call.call_id),
-                "data": {"callType": call.call_type, "codec": "", "extendData": "", "groupId": super::engine::num_json(call.group_id), "status": status},
+                "callType": call.call_type,
+                "data": {"callType": call.call_type, "codec": "", "extendData": "", "groupId": gid_json(call), "status": status},
                 "hostCall": super::engine::num_json(call.host_call),
+                "partners": member_ids(call),
                 "session": call.sess_id,
                 "status": status,
             }),
         }]
     }
 
-    /// Relay registration done for a group call: join (12434) + start pinging.
+    /// Relay registration done: announce (12434) / answer (12436), join the
+    /// media room (12043), then broadcast state + start pinging.
     pub(crate) fn group_prepared(&mut self, now: f64, best: &Option<super::engine::InitReply>) -> Vec<Out> {
-        let (call_id, call_type, host_call, max_users, group_id, group_id_str, avatar, title, invited, sess_id, is_caller, first_server) = {
+        let (call_id, call_type, host_call, max_users, group_id, group_id_str, avatar, title, invited, sess_id, is_caller, first_server, local_uid, muted, camera_on) = {
             let Some(call) = &self.call else { return vec![] };
             if !call.group || call.state != State::Connecting {
                 return vec![];
@@ -360,6 +410,9 @@ impl<M: Media> Engine<M> {
                 call.sess_id.clone(),
                 call.role == Role::Caller,
                 call.server.as_array().and_then(|a| a.first().cloned()).unwrap_or(Value::Null),
+                call.local_uid,
+                call.muted,
+                call.camera_on,
             )
         };
         if best.is_none() && self.media.send_udp() {
@@ -395,6 +448,7 @@ impl<M: Media> Engine<M> {
             out.push(Out::SendSignal {
                 code: 12434,
                 data: json!({
+                    "calleeId": group_id_str,
                     "callId": super::engine::num_json(call_id),
                     "callType": call_type,
                     "data": {
@@ -420,6 +474,21 @@ impl<M: Media> Engine<M> {
         } else {
             out.extend(self.group_send_answer(0));
         }
+        // 12043 join: báo relay đã vào phòng media (`/api/voicecall/group/join`).
+        // Key đủ theo relay renderer; `status`/`srcJoinCall` là suy đoán (0).
+        out.push(Out::SendSignal {
+            code: 12043,
+            data: json!({
+                "userId": super::engine::num_json(local_uid),
+                "callId": super::engine::num_json(call_id),
+                "hostCall": super::engine::num_json(host_call),
+                "status": 0,
+                "srcJoinCall": 0,
+                "audioState": if muted { 1 } else { 0 },
+                "videoState": if camera_on.unwrap_or(false) { 0 } else { 1 },
+                "data": {},
+            }),
+        });
         out.extend(self.group_broadcast());
         if let Some(call) = &mut self.call {
             call.ping_deadline = Some(now + call.ping_ms);
@@ -437,6 +506,7 @@ impl<M: Media> Engine<M> {
             "callId": super::engine::num_json(call.call_id),
             "callState": 3,
             "hostCall": super::engine::num_json(call.host_call),
+            "params": {},
             "userId": super::engine::num_json(call.local_uid),
             "videoState": if call.camera_on.unwrap_or(false) { 0 } else { 1 },
         })
@@ -667,9 +737,12 @@ impl<M: Media> Engine<M> {
             out.push(Out::SendSignal {
                 code: 12437,
                 data: json!({
+                    "calleeId": gid_json(call),
                     "callId": super::engine::num_json(call.call_id),
-                    "data": {"callType": call.call_type, "duration": 0, "extraData": "", "groupId": super::engine::num_json(call.group_id)},
+                    "callType": call.call_type,
+                    "data": {"callType": call.call_type, "duration": 0, "extraData": "", "groupId": gid_json(call)},
                     "hostCall": super::engine::num_json(call.host_call),
+                    "partners": call.invite_partners.as_ref().map(|list| list.iter().map(|(_, _, id)| json!(id)).collect::<Vec<_>>()).unwrap_or_default(),
                 }),
             });
         }
@@ -679,7 +752,7 @@ impl<M: Media> Engine<M> {
     }
 
     pub(crate) fn group_finish(&mut self, now: f64, status: i64, close_code: &str, _emit_signals: bool) -> Vec<Out> {
-        let (call_id, host_call, call_type, group_id, was_connected, started_at, sess_truthy) = {
+        let (call_id, host_call, call_type, group_id, local_uid, partners, was_connected, started_at, sess_truthy) = {
             let Some(call) = &self.call else { return vec![] };
             if call.state == State::Ended {
                 return vec![];
@@ -688,7 +761,9 @@ impl<M: Media> Engine<M> {
                 call.call_id,
                 call.host_call,
                 call.call_type,
-                call.group_id,
+                gid_json(call),
+                call.local_uid,
+                member_ids(call),
                 call.state == State::Connected,
                 call.started_at,
                 truthy(Some(&call.sess_id)),
@@ -708,9 +783,12 @@ impl<M: Media> Engine<M> {
             out.push(Out::SendSignal {
                 code: 12438,
                 data: json!({
+                    "calleeId": super::engine::num_json(local_uid),
                     "callId": super::engine::num_json(call_id),
+                    "callType": call_type,
                     "data": {"callType": call_type, "duration": duration, "extraData": "", "groupId": group_id, "status": 0},
                     "hostCall": super::engine::num_json(host_call),
+                    "partners": partners,
                 }),
             });
             let stats = json!({
@@ -728,6 +806,7 @@ impl<M: Media> Engine<M> {
                     "duration": duration,
                     "hostCall": super::engine::num_json(host_call),
                     "joinTime": super::engine::num_json(started_at),
+                    "partners": partners,
                     "status": status,
                 }),
             });
@@ -852,6 +931,12 @@ impl<M: Media> Engine<M> {
             }
             let state = self.call.as_ref().map(|c| (c.state, c.role, c.answered));
             match state {
+                // Callee không trả lời (45 s): auto-decline + dọn state.
+                Some((State::Incoming, Role::Callee, _)) if ms == super::engine::RING_TIMEOUT_MS => {
+                    let mut out = self.group_send_answer(3);
+                    out.extend(self.group_finish(now, 0, "groupNoAnswer", false));
+                    return out;
+                }
                 // Deferred finish (3 s) sau Failed/JoinRejected.
                 Some((State::Failed, _, _)) | Some((State::Connecting, _, _)) if ms == 3000.0 => {
                     let failed = self.call.as_ref().map(|c| c.state == State::Failed).unwrap_or(false);

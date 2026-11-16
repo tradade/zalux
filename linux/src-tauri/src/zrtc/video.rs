@@ -52,6 +52,117 @@ pub struct VideoFrame {
     pub ts: u32,
 }
 
+// ------------------------------------------------------------------ render
+// Video RX render: assembled H.264 → JPEG snapshots cho panel in-call.
+// Decode bằng OpenH264 từ source bundle (self-contained cho AppImage, không
+// tải lib ngoài lúc build); JPEG qua `image` (đã có). Decode mọi frame để
+// giữ mạch tham chiếu H.264, nhưng chỉ mã hoá JPEG khi đã qua `EMIT_EVERY_MS`
+// — panel chỉ cần ~2 fps để "thấy mặt bên kia".
+
+use openh264::decoder::Decoder as H264Decoder;
+use openh264::formats::YUVSource;
+
+/// Tối thiểu giữa hai JPEG emit (ms) và bề rộng tối đa của JPEG.
+const EMIT_EVERY_MS: f64 = 500.0;
+const MAX_WIDTH: u32 = 480;
+const JPEG_QUALITY: u8 = 60;
+
+pub struct FrameRenderer {
+    dec: Option<H264Decoder>,
+    last_emit_ms: f64,
+}
+
+impl FrameRenderer {
+    pub fn new() -> Self {
+        Self { dec: None, last_emit_ms: f64::NEG_INFINITY }
+    }
+
+    /// Decode `frame` (Annex-B từ `VideoAssembler`); trả JPEG khi tới lượt
+    /// emit. `None` = chưa tới lượt / chưa ra hình / decode hỏng (tự reset
+    /// decoder để keyframe sau mở lại mạch).
+    pub fn push(&mut self, frame: &VideoFrame, now_ms: f64) -> Option<Vec<u8>> {
+        if self.dec.is_none() {
+            self.dec = H264Decoder::new().ok();
+        }
+        let dec = self.dec.as_mut()?;
+        // Assembler 1-1 giữ stream gần như nguyên gốc từ packetizer (đã có
+        // start code); frame nào không có thì bọc một NAL đơn.
+        let mut owned;
+        let annex: &[u8] = if has_start_code(&frame.data) {
+            &frame.data
+        } else {
+            owned = Vec::with_capacity(frame.data.len() + 4);
+            owned.extend_from_slice(&[0, 0, 0, 1]);
+            owned.extend_from_slice(&frame.data);
+            &owned
+        };
+        let mut units = nal_units(annex);
+        if units.is_empty() {
+            units.push(annex.to_vec());
+        }
+        let mut picture: Option<(u32, u32, Vec<u8>)> = None;
+        for u in &units {
+            let mut pkt = Vec::with_capacity(u.len() + 4);
+            pkt.extend_from_slice(&[0, 0, 0, 1]);
+            pkt.extend_from_slice(u);
+            match dec.decode(&pkt) {
+                Ok(Some(yuv)) => {
+                    let (w, h) = yuv.dimensions();
+                    if w == 0 || h == 0 {
+                        continue;
+                    }
+                    let mut rgb = vec![0u8; yuv.rgb8_len()];
+                    yuv.write_rgb8(&mut rgb);
+                    picture = Some((w as u32, h as u32, rgb));
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    self.dec = None;
+                    return None;
+                }
+            }
+        }
+        let (w, h, rgb) = picture?;
+        if now_ms - self.last_emit_ms < EMIT_EVERY_MS {
+            return None;
+        }
+        self.last_emit_ms = now_ms;
+        Some(rgb_to_jpeg(&rgb, w, h))
+    }
+}
+
+impl Default for FrameRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn has_start_code(data: &[u8]) -> bool {
+    data.len() >= 3 && data.windows(3).any(|w| w == [0, 0, 1])
+}
+
+fn rgb_to_jpeg(rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::ExtendedColorType;
+    let img = match image::RgbImage::from_raw(w, h, rgb.to_vec()) {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    // Panel chỉ cần ~480px: vừa nhẹ IPC (data URL qua webkit), vừa rẻ CPU.
+    let img = if w > MAX_WIDTH {
+        let nh = (h * MAX_WIDTH / w).max(1);
+        image::imageops::resize(&img, MAX_WIDTH, nh, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let mut buf = Vec::new();
+    let mut enc = JpegEncoder::new_with_quality(&mut buf, JPEG_QUALITY);
+    if enc.encode(img.as_raw(), img.width(), img.height(), ExtendedColorType::Rgb8).is_err() {
+        return Vec::new();
+    }
+    buf
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AssemblerStats {
     pub frames: i32,

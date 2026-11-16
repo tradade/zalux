@@ -11,6 +11,7 @@ struct FakeMedia {
     started: usize,
     udp: bool,
     last_params: Option<NegotiatedParams>,
+    idle_ms: Option<f64>,
 }
 
 impl Media for FakeMedia {
@@ -30,6 +31,9 @@ impl Media for FakeMedia {
     }
     fn stats(&self) -> (u64, u64) {
         (7, 9)
+    }
+    fn rx_idle_ms(&self, _now_ms: f64) -> Option<f64> {
+        self.idle_ms
     }
 }
 
@@ -76,13 +80,19 @@ fn group_outgoing_full_flow() {
     let params = e.media.last_params.as_ref().unwrap();
     assert!(params.group && params.host && params.sess_id == GROUP_SESSION);
 
-    // Relay registered → 12434 join + 12098 broadcast; ping scheduled.
+    // Relay registered → 12434 announce + 12043 join + 12098 broadcast.
     let best = InitReply { server: group_servers()[0].clone(), public_addr: None };
     let out = e.media_prepared(now, Some(best));
-    assert_eq!(codes(&out), vec![12434, 12098]);
+    assert_eq!(codes(&out), vec![12434, 12043, 12098]);
     let s = find_signal(&out, 12434);
     assert_eq!(s["data"]["data"]["hostCall"], 1234);
     assert_eq!(s["session"], GROUP_SESSION);
+    // 12043 join đủ key relay renderer cần (flat, theo app.asar).
+    let j = find_signal(&out, 12043);
+    assert_eq!(j["userId"], 1234);
+    assert_eq!(j["hostCall"], 1234);
+    assert!(j.get("audioState").is_some() && j.get("videoState").is_some());
+    assert!(j.get("status").is_some() && j.get("srcJoinCall").is_some());
     assert!(e.call.as_ref().unwrap().ping_deadline.is_some());
 
     // The ping fires on the interval and repeats.
@@ -127,14 +137,18 @@ fn group_incoming_flow() {
     assert_eq!(codes(&out), vec![12439]);
     let s = find_signal(&out, 12439);
     assert_eq!(s["status"], 1);
+    // 12439 mang partners thật (Lan 5678 từ partnerInfo), không rỗng.
+    let partners = s["partners"].as_array().cloned().unwrap_or_default();
+    assert!(partners.iter().any(|p| p.as_f64() == Some(5678.0)), "12439 thiếu partners");
     assert!(matches!(e.call.as_ref().map(|c| (c.group, c.state)), Some((true, State::Incoming))));
 
     // Accept → prepare → 12436 status 0.
     let out = e.accept(now);
     assert!(out.iter().any(|o| matches!(o, Out::Ui(x) if x.status_code() == "connecting")));
     let out = e.media_prepared(now, Some(InitReply { server: group_servers()[0].clone(), public_addr: None }));
-    assert_eq!(codes(&out), vec![12436, 12098]);
+    assert_eq!(codes(&out), vec![12436, 12043, 12098]);
     assert_eq!(find_signal(&out, 12436)["status"], 0);
+    assert_eq!(find_signal(&out, 12043)["userId"], 1234);
 
     // Peer ends the group call from the host: everyone left → we finish.
     let out = e.group_roster(now + 1_000.0, &[1234]);
@@ -219,4 +233,64 @@ fn group_answer_on_other_device_finishes_silently() {
     // Answered elsewhere: finish(0) without join signals.
     assert_eq!(codes(&out), Vec::<i64>::new());
     assert!(!e.in_call());
+}
+
+#[test]
+fn group_callee_no_answer_auto_declines() {
+    let mut e = engine(false);
+    let now = 0.0;
+    e.handle_control(now, "group_request", &json!({"data": {
+        "id": 900, "hostCall": 1234, "groupId": 77, "receiverId": 1234, "callType": 0,
+        "session": GROUP_SESSION,
+        "callSetting": json!({"servers": group_servers()}).to_string(),
+    }}));
+    assert!(e.in_call());
+    // Callee không trả lời sau 45 s: 12436 status 3 + dọn state.
+    let out = e.tick(now + 45_000.0);
+    assert_eq!(codes(&out), vec![12436]);
+    let s = find_signal(&out, 12436);
+    assert_eq!(s["status"], 3);
+    assert_eq!(s["calleeId"], 1234);
+    assert!(!e.in_call());
+}
+
+#[test]
+fn group_signals_carry_relay_keys() {
+    let mut e = engine(false);
+    let now = 0.0;
+    // Host tạo phòng: 12433 đã đủ key từ trước.
+    let out = e.make_call(now, &json!({"type": 5, "groupInfo": {"name": "Nhóm A", "id": "g1"}, "partner": [{"id": "5678"}]}));
+    let s = find_signal(&out, 12433);
+    assert!(s.get("groupId").is_some() && s.get("partners").is_some());
+    e.handle_recv_signal(now, "12433", &json!({
+        "data": json!({"status": 0, "hostCall": 1234, "callId": 900, "groupId": 77, "session": GROUP_SESSION,
+                        "callSetting": json!({"servers": group_servers()}).to_string()})
+    }));
+    // Đăng ký xong: 12434 join phải có calleeId/partners cho relay JS.
+    let best = InitReply { server: group_servers()[0].clone(), public_addr: None };
+    let out = e.media_prepared(now, Some(best));
+    let s = find_signal(&out, 12434);
+    assert!(s.get("calleeId").is_some(), "12434 thiếu calleeId");
+    assert!(s.get("partners").is_some(), "12434 thiếu partners");
+    // Callee join xong ping lỗi nhưng media còn chảy → giữ cuộc gọi.
+    e.media.idle_ms = Some(1_000.0);
+    let out = e.handle_recv_signal(now + 11_000.0, "12097", &json!({"data": json!({"error": -1}).to_string()}));
+    assert!(out.is_empty(), "ping lỗi oan khi media còn chảy");
+    assert!(e.in_call());
+}
+
+#[test]
+fn group_decline_carries_callee_and_partners() {
+    let mut e = engine(false);
+    let now = 0.0;
+    e.handle_control(now, "group_request", &json!({"data": {
+        "id": 900, "hostCall": 1234, "groupId": 77, "receiverId": 1234, "callType": 0,
+        "session": GROUP_SESSION,
+        "callSetting": json!({"servers": group_servers()}).to_string(),
+    }}));
+    let out = e.reject(now, "user");
+    let s = find_signal(&out, 12436);
+    assert_eq!(s["status"], 3);
+    assert_eq!(s["calleeId"], 1234);
+    assert!(s.get("callType").is_some() && s.get("hostCall").is_some() && s.get("partners").is_some());
 }

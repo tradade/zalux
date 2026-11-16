@@ -65,6 +65,7 @@ const MEMBERS: &[(&str, &str)] = &[
     ("$olaz.jxl.info", "async"),
     ("$olaz.photo.cache", "async"),
     ("$zFeatures.mainless.execRaw", "async"),
+    ("$zFeatures.mainless.exec", "async"),
     ("$zFeatures.genThumb.writeSavePathFilePhoto", "async"),
     ("$zFileManager.getSentryConfig", "sync"),
     ("$zFileManager.saveSentryConfig", "async"),
@@ -159,7 +160,26 @@ const MEMBERS: &[(&str, &str)] = &[
     // for the free-space banner and `$znode.diskSpace(dir)` before downloads/export.
     ("$znode.nativelibs.fileUtils.getDiskUsage", "sync"),
     ("$znode.nativelibs.fileUtilsAddon.getDiskUsage", "sync"),
+    ("$znode.nativelibs.fileUtilities.getDiskUsage", "sync"),
     ("$znode.diskSpace", "async"),
+    // Resource-manager size scan (Cài đặt → Quản lý dữ liệu): the renderer
+    // computes every category with one native call instead of thousands of
+    // per-file `$znode.fs` round trips (each a blocking loopback XHR that
+    // froze the page on a 1.6 GB profile). All three addon spellings resolve
+    // to the same Rust walk.
+    ("$znode.nativelibs.fileUtils.getDirectorySizeAsync", "async"),
+    ("$znode.nativelibs.fileUtilsAddon.getDirectorySizeAsync", "async"),
+    ("$znode.nativelibs.fileUtilities.getDirectorySizeAsync", "async"),
+    ("$znode.nativelibs.fileUtils.getDirectorySizeByGlobAsync", "async"),
+    ("$znode.nativelibs.fileUtilsAddon.getDirectorySizeByGlobAsync", "async"),
+    ("$znode.nativelibs.fileUtilities.getDirectorySizeByGlobAsync", "async"),
+    ("$znode.nativelibs.fileUtils.getDirectorySizeSync", "sync"),
+    ("$znode.nativelibs.fileUtilsAddon.getDirectorySizeSync", "sync"),
+    ("$znode.nativelibs.fileUtilities.getDirectorySizeSync", "sync"),
+    ("$znode.fastGlob", "async"),
+    // Delete flow (Quản lý dữ liệu → xóa cache/conversation): the renderer
+    // falls back to `$znode.rimraf` when the mainless worker has no delete task.
+    ("$znode.rimraf", "async"),
 ];
 
 /// CryptoJS preset the official `zsafe-storage` cipher uses (`bridge-spec.md` §2.1).
@@ -909,7 +929,45 @@ impl Bridge {
             }
             "$znode.nativelibs.fileUtils.getDiskUsage"
             | "$znode.nativelibs.fileUtilsAddon.getDiskUsage"
+            | "$znode.nativelibs.fileUtilities.getDiskUsage"
             | "$znode.diskSpace" => disk_usage(&str_arg(args, 0).unwrap_or_default()),
+            "$znode.nativelibs.fileUtils.getDirectorySizeAsync"
+            | "$znode.nativelibs.fileUtilsAddon.getDirectorySizeAsync"
+            | "$znode.nativelibs.fileUtilities.getDirectorySizeAsync" => {
+                let path = str_arg(args, 0).unwrap_or_default();
+                let opts = args.get(1).cloned().unwrap_or(Value::Null);
+                Ok(dir_size_value(&self.abs(&path), &opts))
+            }
+            "$znode.nativelibs.fileUtils.getDirectorySizeSync"
+            | "$znode.nativelibs.fileUtilsAddon.getDirectorySizeSync"
+            | "$znode.nativelibs.fileUtilities.getDirectorySizeSync" => {
+                let path = str_arg(args, 0).unwrap_or_default();
+                Ok(json!(dir_total(&self.abs(&path))))
+            }
+            "$znode.nativelibs.fileUtils.getDirectorySizeByGlobAsync"
+            | "$znode.nativelibs.fileUtilsAddon.getDirectorySizeByGlobAsync"
+            | "$znode.nativelibs.fileUtilities.getDirectorySizeByGlobAsync" => {
+                let pattern = str_arg(args, 0).unwrap_or_default();
+                let (total, count) = dir_size_glob(&pattern);
+                Ok(json!({ "totalSize": total, "fileCount": count }))
+            }
+            "$znode.fastGlob" => {
+                let pattern = str_arg(args, 0).unwrap_or_default();
+                let opts = args.get(1).cloned().unwrap_or(Value::Null);
+                Ok(fast_glob_value(&pattern, &opts))
+            }
+            "$znode.rimraf" => {
+                let target = self.abs(&str_arg(args, 0).unwrap_or_default());
+                let display = target.display().to_string();
+                let result = if target.is_dir() {
+                    std::fs::remove_dir_all(&target)
+                } else if target.exists() {
+                    std::fs::remove_file(&target)
+                } else {
+                    Ok(())
+                };
+                result.map(|_| undefined()).map_err(|err| io_error(&err, &display))
+            }
             "$znode.fs.exists" => Ok(Value::Bool(self.abs(&str_arg(args, 0).unwrap_or_default()).exists())),
             other if other.starts_with("$znode.fs.") || other.starts_with("$znode.fsPromise.") || other.starts_with("$znode.fsExtra.") => {
                 self.fs_call(other, args)
@@ -980,6 +1038,9 @@ impl Bridge {
                     Err(err) => Err(io_error(&err, &display)),
                 }
             }
+            // `fs-extra.pathExists` never throws: the delete flow probes folders
+            // with it before deciding between the v2 and the legacy cleaner.
+            "pathExists" | "exists" => Ok(Value::Bool(target.exists())),
             "existsSync" | "accessSync" | "access" => {
                 if target.exists() {
                     Ok(Value::Bool(true))
@@ -1024,17 +1085,52 @@ impl Bridge {
             }
             "readdirSync" | "readdir" => std::fs::read_dir(&target)
                 .map(|entries| {
+                    // `withFileTypes: true` asks for Dirents. Their methods cannot
+                    // cross the bridge, so each entry carries the same facts as
+                    // plain data; without the flag the shape stays a string array.
+                    let with_types = args
+                        .get(1)
+                        .and_then(|v| v.get("withFileTypes"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     let mut names: Vec<Value> = entries
                         .filter_map(|entry| entry.ok())
-                        .map(|entry| Value::String(entry.file_name().to_string_lossy().into_owned()))
+                        .map(|entry| {
+                            if !with_types {
+                                return Value::String(entry.file_name().to_string_lossy().into_owned());
+                            }
+                            let ft = entry.file_type().ok();
+                            json!({
+                                "name": entry.file_name().to_string_lossy(),
+                                "isFile": ft.as_ref().map(|f| f.is_file()).unwrap_or(false),
+                                "isDirectory": ft.as_ref().map(|f| f.is_dir()).unwrap_or(false),
+                                "isSymbolicLink": ft.as_ref().map(|f| f.is_symlink()).unwrap_or(false),
+                            })
+                        })
                         .collect();
-                    names.sort_by(|a, b| a.as_str().unwrap_or("").cmp(b.as_str().unwrap_or("")));
+                    let key = |v: &Value| {
+                        v.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
+                            v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string()
+                        })
+                    };
+                    names.sort_by(|a, b| key(a).cmp(&key(b)));
                     Value::Array(names)
                 })
                 .map_err(|err| io_error(&err, &display)),
             "unlinkSync" | "unlink" | "removeSync" | "remove" | "rm" | "rmdir" => {
+                // `rmdir(path, {recursive: true})` and `rm(path, {recursive, force})`
+                // both empty whole conversation folders during cache cleanup —
+                // without the flag a non-empty dir fails exactly like Node's.
+                let opts = args.get(1).cloned().unwrap_or(Value::Null);
+                let recursive = opts.as_bool().unwrap_or(false)
+                    || opts.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false)
+                    || (op == "rm" && opts.get("force").and_then(|v| v.as_bool()).unwrap_or(false));
                 let result = if target.is_dir() {
-                    if op == "rmdir" { std::fs::remove_dir(&target) } else { std::fs::remove_dir_all(&target) }
+                    if op == "rmdir" && !recursive {
+                        std::fs::remove_dir(&target)
+                    } else {
+                        std::fs::remove_dir_all(&target)
+                    }
                 } else if target.exists() {
                     std::fs::remove_file(&target)
                 } else {
@@ -1529,9 +1625,13 @@ impl Bridge {
             // exists it decodes the message photo in the mainless worker, checks the
             // md5, then writes a JPEG next to the conversation. macOS runs those in
             // `mainless-worker.js`; both tasks are plain image work, so they live here.
-            "exec_raw" => {
+            "exec_raw" | "exec" => {
                 exec_raw(&str_arg(args, 0).unwrap_or_default(), args.get(1).cloned().unwrap_or(Value::Null))
             }
+            // Health-monitor page (`$zperf.getProcessInfos`): same family as
+            // `get-cpu-infos` below; an unknown channel used to resolve
+            // `undefined` and left the monitor waiting.
+            "get-process-info" => Ok(process_metric(std::process::id() as i64)),
             "gen-thumb_write-savepath-file-photo" => {
                 let bytes = arg_bytes(args, 2)
                     .ok_or_else(|| "EINVAL: thiếu buffer thumbnail".to_string())?;
@@ -1643,15 +1743,7 @@ impl Bridge {
 
             // $zperf.getCpuInfos → Electron app.getAppMetrics(). The renderer
             // reduces over this array; returning undefined rejected its promise.
-            "get-cpu-infos" => {
-                let pid = std::process::id() as i64;
-                Ok(json!([{
-                    "pid": pid,
-                    "type": "Browser",
-                    "cpu": { "percentCPUUsage": 0.0, "idleWakeupsPerSecond": 0 },
-                    "memory": { "workingSetSize": 0, "peakWorkingSetSize": 0 },
-                }]))
-            }
+            "get-cpu-infos" => Ok(process_metric(std::process::id() as i64)),
 
             // -------------------------------------------------- shared worker
             // The viewer key decrypts the local data stores. Electron main kept
@@ -2067,12 +2159,386 @@ fn trace_call(name: &str, args: &[Value]) {
     eprintln!("[bridge] call {name} {brief}");
 }
 
+/// Bulk directory-size helpers for Cài đặt → Quản lý dữ liệu.
+///
+/// The renderer used to derive every category by walking `ZaloDownloads`
+/// file-by-file over the bridge (one blocking loopback XHR per `stat` on a
+/// 1.6 GB profile → frozen page, spinners that never settle because the
+/// native `fileUtilities().getDirectorySize*`, `fastGlob` and mainless
+/// `getLocalSize` tasks had no Linux implementation). Each helper below does
+/// the whole walk in one Rust call and returns the exact shape the official
+/// code reads (`totalSize` / `fileCount` / `tree`).
+const DIR_WALK_LIMIT: usize = 500_000;
+
+fn dir_total(path: &std::path::Path) -> u64 {
+    let (total, _) = walk_dir(path, usize::MAX, false);
+    total
+}
+
+fn walk_dir(path: &std::path::Path, max_depth: usize, dot: bool) -> (u64, u64) {
+    fn visit(dir: &std::path::Path, depth: usize, max_depth: usize, dot: bool, total: &mut u64, count: &mut u64, seen: &mut usize) {
+        if *seen > DIR_WALK_LIMIT {
+            return;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries {
+            if *seen > DIR_WALK_LIMIT {
+                return;
+            }
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !dot && name.starts_with('.') {
+                continue;
+            }
+            *seen += 1;
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                if depth < max_depth {
+                    visit(&entry.path(), depth + 1, max_depth, dot, total, count, seen);
+                } else if max_depth == usize::MAX {
+                    visit(&entry.path(), depth + 1, max_depth, dot, total, count, seen);
+                }
+                continue;
+            }
+            if ft.is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    *total += meta.len();
+                    *count += 1;
+                }
+            }
+        }
+    }
+    let mut total = 0u64;
+    let mut count = 0u64;
+    let mut seen = 0usize;
+    if max_depth == 0 {
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.is_file() {
+                return (meta.len(), 1);
+            }
+        }
+        return (0, 0);
+    }
+    visit(path, 0, max_depth, dot, &mut total, &mut count, &mut seen);
+    (total, count)
+}
+
+fn dir_walk_opts(path: &std::path::Path, opts: &Value) -> (u64, u64, usize) {
+    let deep = opts.get("deep").and_then(|v| v.get("maxDepth")).and_then(|v| v.as_u64());
+    let dot = opts.get("dot").and_then(|v| v.as_bool()).unwrap_or(false);
+    let max_depth = deep.map(|d| (d as usize).saturating_add(1)).unwrap_or(usize::MAX);
+    let (total, count) = walk_dir(path, max_depth, dot);
+    (total, count, deep.map(|_| 1).unwrap_or(0))
+}
+
+fn dir_size_value(path: &std::path::Path, opts: &Value) -> Value {
+    let deep_1 = opts
+        .get("deep")
+        .and_then(|v| v.get("maxDepth"))
+        .and_then(|v| v.as_u64())
+        == Some(1);
+    let dot = opts.get("dot").and_then(|v| v.as_bool()).unwrap_or(false);
+    if deep_1 {
+        // `{totalSize, tree:[{relativePath,totalSize}]}` — the overview page
+        // renders the top-level breakdown from `tree`.
+        let mut total = 0u64;
+        let mut tree = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !dot && name.starts_with('.') {
+                    continue;
+                }
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_symlink() {
+                    continue;
+                }
+                let sub = entry.path();
+                let (sub_total, _) = walk_dir(&sub, usize::MAX, dot);
+                let sub_total = if ft.is_file() {
+                    entry.metadata().map(|m| m.len()).unwrap_or(sub_total)
+                } else {
+                    sub_total
+                };
+                total += sub_total;
+                tree.push(json!({ "relativePath": name, "totalSize": sub_total }));
+            }
+        }
+        tree.sort_by(|a, b| {
+            b.get("totalSize").and_then(|v| v.as_u64()).unwrap_or(0)
+                .cmp(&a.get("totalSize").and_then(|v| v.as_u64()).unwrap_or(0))
+        });
+        return json!({ "totalSize": total, "fileCount": tree.len(), "tree": tree });
+    }
+    let (total, count, _) = dir_walk_opts(path, opts);
+    json!({ "totalSize": total, "fileCount": count })
+}
+
+fn split_glob(pattern: &str) -> (String, Vec<String>) {
+    // `…/resource/*/<type>/**` → (base, [sub-patterns]). Only `*`, `?` and
+    // `**` are needed for the resource-manager globs.
+    let normalized = pattern.replace('\\', "/");
+    let (base, rest) = match normalized.find('*') {
+        Some(i) => {
+            let slash = normalized[..i].rfind('/').map(|j| j + 1).unwrap_or(0);
+            (normalized[..slash].to_string(), normalized[slash..].to_string())
+        }
+        None => (normalized.clone(), String::new()),
+    };
+    let parts: Vec<String> = if rest.is_empty() {
+        // No wildcard: the whole pattern is one existing path, walked directly.
+        Vec::new()
+    } else {
+        rest.split('/').map(|s| s.to_string()).collect()
+    };
+    (base, parts)
+}
+
+fn glob_match(pattern: &str, name: &str) -> bool {
+    // Single path-component matcher: `*` spans any run, `?` one char.
+    let (mut px, mut nx) = (pattern.as_bytes(), name.as_bytes());
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    let (mut i, mut j) = (0usize, 0usize);
+    while j < nx.len() {
+        if i < px.len() && (px[i] == b'?' || px[i] == nx[j]) {
+            i += 1;
+            j += 1;
+        } else if i < px.len() && px[i] == b'*' {
+            star = Some(i);
+            mark = j;
+            i += 1;
+        } else if star.is_some() {
+            i = star.unwrap() + 1;
+            mark += 1;
+            j = mark;
+        } else {
+            return false;
+        }
+    }
+    while i < px.len() && px[i] == b'*' {
+        i += 1;
+    }
+    i == px.len()
+}
+
+fn dir_size_glob(pattern: &str) -> (u64, u64) {
+    let (base, parts) = split_glob(pattern);
+    let base = std::path::Path::new(&base);
+    if parts.is_empty() {
+        let (t, c) = walk_dir(base, usize::MAX, true);
+        return (t, c);
+    }
+    fn collect(dir: &std::path::Path, parts: &[String], out: &mut Vec<std::path::PathBuf>) {
+        if parts.is_empty() {
+            out.push(dir.to_path_buf());
+            return;
+        }
+        if parts[0] == "**" {
+            out.push(dir.to_path_buf());
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(top) = stack.pop() {
+                if let Ok(entries) = std::fs::read_dir(&top) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().map(|f| f.is_dir()).unwrap_or(false) {
+                            let p = entry.path();
+                            out.push(p.clone());
+                            stack.push(p);
+                        }
+                    }
+                }
+            }
+            let rest = &parts[1..];
+            if rest.iter().all(|p| p == "**" || p.is_empty()) {
+                return;
+            }
+            let mut expanded = Vec::new();
+            for root in out.clone() {
+                collect(&root, rest, &mut expanded);
+            }
+            *out = expanded;
+            return;
+        }
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if glob_match(&parts[0], &name) {
+                    if parts.len() == 1 {
+                        out.push(entry.path());
+                    } else if entry.file_type().map(|f| f.is_dir()).unwrap_or(false) {
+                        collect(&entry.path(), &parts[1..], out);
+                    }
+                }
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    collect(base, &parts, &mut hits);
+    let mut total = 0u64;
+    let mut count = 0u64;
+    for hit in hits {
+        if let Ok(meta) = std::fs::metadata(&hit) {
+            if meta.is_file() {
+                total += meta.len();
+                count += 1;
+            } else if meta.is_dir() {
+                let (t, c) = walk_dir(&hit, usize::MAX, true);
+                total += t;
+                count += c;
+            }
+        }
+    }
+    (total, count)
+}
+
+fn fast_glob_value(pattern: &str, opts: &Value) -> Value {
+    let cwd = opts
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let absolute = opts.get("absolute").and_then(|v| v.as_bool()).unwrap_or(false);
+    let only_files = opts.get("onlyFiles").and_then(|v| v.as_bool()).unwrap_or(false);
+    let with_stats = opts.get("stats").and_then(|v| v.as_bool()).unwrap_or(false);
+    let full = if cwd.is_empty() {
+        pattern.to_string()
+    } else if pattern.is_empty() {
+        cwd.clone()
+    } else {
+        format!("{}/{}", cwd.trim_end_matches('/'), pattern)
+    };
+    let (base, parts) = split_glob(&full);
+    let mut hits: Vec<std::path::PathBuf> = Vec::new();
+    {
+        fn collect(dir: &std::path::Path, parts: &[String], only_files: bool, out: &mut Vec<std::path::PathBuf>) {
+            if parts.is_empty() {
+                if dir.exists() && (!only_files || dir.is_file()) {
+                    out.push(dir.to_path_buf());
+                }
+                return;
+            }
+            if parts[0] == "**" {
+                if parts.len() == 1 {
+                    let mut stack = vec![dir.to_path_buf()];
+                    while let Some(top) = stack.pop() {
+                        if let Ok(entries) = std::fs::read_dir(&top) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                let is_dir = entry.file_type().map(|f| f.is_dir()).unwrap_or(false);
+                                if !only_files || !is_dir {
+                                    if entry.file_type().map(|f| f.is_file()).unwrap_or(false) || !only_files {
+                                        out.push(p.clone());
+                                    }
+                                }
+                                if is_dir {
+                                    stack.push(p);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                collect(dir, &parts[1..], only_files, out);
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().map(|f| f.is_dir()).unwrap_or(false) {
+                            collect(&entry.path(), parts, only_files, out);
+                        }
+                    }
+                }
+                return;
+            }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if glob_match(&parts[0], &name) {
+                        if parts.len() == 1 {
+                            let is_dir = entry.file_type().map(|f| f.is_dir()).unwrap_or(false);
+                            if !only_files || !is_dir {
+                                out.push(entry.path());
+                            }
+                        } else if entry.file_type().map(|f| f.is_dir()).unwrap_or(false) {
+                            collect(&entry.path(), &parts[1..], only_files, out);
+                        }
+                    }
+                }
+            }
+        }
+        collect(std::path::Path::new(&base), &parts, only_files, &mut hits);
+    }
+    hits.sort();
+    if with_stats {
+        let arr: Vec<Value> = hits
+            .iter()
+            .map(|p| {
+                let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                let s = if absolute || p.is_absolute() {
+                    p.to_string_lossy().into_owned()
+                } else {
+                    p.to_string_lossy().into_owned()
+                };
+                json!({ "path": s, "stats": { "size": size } })
+            })
+            .collect();
+        return Value::Array(arr);
+    }
+    Value::Array(
+        hits.into_iter()
+            .map(|p| Value::String(p.to_string_lossy().into_owned()))
+            .collect(),
+    )
+}
+
+/// RSS / peak-RSS of this process from `/proc/self/status` (`VmRSS`/`VmHWM`,
+/// kB → bytes). This fills `memory.workingSetSize` in the health-monitor and
+/// `$zperf` metrics (`get-process-info`, `get-cpu-infos`) instead of the
+/// previous hard-coded 0 that left the memory row blank.
+fn process_memory() -> (u64, u64) {
+    let mut rss = 0u64;
+    let mut peak = 0u64;
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            let Some((key, rest)) = line.split_once(':') else { continue };
+            let kb: u64 = rest.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            match key {
+                "VmRSS" => rss = kb.saturating_mul(1024),
+                "VmHWM" => peak = kb.saturating_mul(1024),
+                _ => {}
+            }
+            if rss != 0 && peak != 0 {
+                break;
+            }
+        }
+    }
+    (rss, peak)
+}
+
+/// One Electron `app.getAppMetrics()` entry: the shape `$zperf` reduces over.
+fn process_metric(pid: i64) -> Value {
+    let (rss, peak) = process_memory();
+    json!([{
+        "pid": pid,
+        "type": "Browser",
+        "cpu": { "percentCPUUsage": 0.0, "idleWakeupsPerSecond": 0 },
+        "memory": { "workingSetSize": rss, "peakWorkingSetSize": peak },
+    }])
+}
+
 /// `$zFeatures.mainless.execRaw` tasks the photo-thumbnail pipeline needs.
 ///
 /// `rmd5` keys the thumbnail cache (`thumb-file-v2` compares it with the checksum
 /// the message carries); `genThumbPicBuffer` decodes the message photo and hands
-/// back a JPEG that fits 600×600. Everything else stays unsupported so the
-/// renderer sees the same rejection macOS gives for tasks Linux has no worker for.
+/// back a JPEG that fits 600×600. The resource-manager size tasks
+/// (`getLocalSize`, `getTotalLocalFiles`, `getDirectorySizeInfo*`,
+/// `getDirSize`, `getDirSizeNoCaching`) walk the same directories the renderer
+/// used to stat file-by-file over the bridge — answering here keeps Cài đặt →
+/// Quản lý dữ liệu on one async call instead of tens of thousands.
 fn exec_raw(task: &str, params: Value) -> Result<Value, String> {
     let params: Vec<Value> = params.as_array().cloned().unwrap_or_default();
     match task {
@@ -2103,6 +2569,70 @@ fn exec_raw(task: &str, params: Value) -> Result<Value, String> {
                 "buffer": bytes_out(jpeg, true),
                 "tDimension": { "width": width, "height": height },
             }))
+        }
+        "getLocalSize" => {
+            let path = params.first().and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let opts = params.get(1).cloned().unwrap_or(Value::Null);
+            let dot = opts.get("dot").and_then(|v| v.as_bool()).unwrap_or(false);
+            let (total, _) = walk_dir(std::path::Path::new(&path), usize::MAX, dot);
+            Ok(json!(total))
+        }
+        "getTotalLocalFiles" => {
+            let path = params.first().and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let dot = params
+                .get(1)
+                .and_then(|v| v.get("dot"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let (_, count) = walk_dir(std::path::Path::new(&path), usize::MAX, dot);
+            Ok(json!(count))
+        }
+        "getDirectorySizeInfoAsync" | "getDirectorySizeInfoSync" => {
+            let path = params.first().and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let total = dir_total(std::path::Path::new(&path));
+            // Folder-send flow reads `.totalSize` off the result.
+            Ok(json!({ "totalSize": total }))
+        }
+        "getDirectorySizeInfoForManyFolders" => {
+            let list: Vec<Value> = params.first().and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let mut out = Vec::new();
+            for entry in list {
+                let p = entry
+                    .get("_path")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| entry.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                out.push(json!(dir_total(std::path::Path::new(&p))));
+            }
+            Ok(Value::Array(out))
+        }
+        "getDirSize" => {
+            let path = params.first().and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let (total, count) = walk_dir(std::path::Path::new(&path), usize::MAX, false);
+            // Full-disk check reads `.totalSize` off the result.
+            Ok(json!({ "totalSize": total, "count": count, "__version__": 1, "data": {} }))
+        }
+        "getDirSizeNoCaching" => {
+            let path = params.first().and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            // Overview page uses the result directly as the byte count.
+            Ok(json!(dir_total(std::path::Path::new(&path))))
+        }
+        "cleanLocalResourceFolder" => {
+            let path = params.first().and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            // Cache/conversation delete (non-v2 flow) awaits this and only
+            // watches for rejection, so empty the folder and report success
+            // like the official worker's `Kt.SUCCESS` (0).
+            if path.is_empty() {
+                return Err("EINVAL: cleanLocalResourceFolder thiếu path".into());
+            }
+            let dir = std::path::Path::new(&path);
+            if dir.exists() {
+                std::fs::remove_dir_all(dir)
+                    .and_then(|_| std::fs::create_dir_all(dir))
+                    .map_err(|err| io_error(&err, &path))?;
+            }
+            Ok(json!(0))
         }
         other => Err(format!("NotSupported: {other}")),
     }
@@ -2824,6 +3354,113 @@ mod tests {
             json!("123")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_helpers_match_resource_manager_patterns() {
+        assert!(glob_match("*.jpg", "a.jpg"));
+        assert!(!glob_match("*.jpg", "a.png"));
+        assert!(glob_match("file_?", "file_1"));
+        assert!(!glob_match("file_?", "file_12"));
+        assert!(glob_match("*", "anything"));
+        assert!(!glob_match("abc", "abcd"));
+        let (base, parts) = split_glob("/a/b/resource/*/*/**");
+        assert_eq!(base, "/a/b/resource/");
+        assert_eq!(parts, vec!["*", "*", "**"]);
+        let (base, parts) = split_glob("/a/b/c");
+        assert_eq!(base, "/a/b/c");
+        assert!(parts.is_empty());
+    }
+
+    #[test]
+    fn dir_walk_counts_bytes_and_files() {
+        let dir = std::env::temp_dir().join(format!("olaz-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![1u8; 100]).unwrap();
+        std::fs::write(dir.join("sub").join("b.bin"), vec![2u8; 50]).unwrap();
+        std::fs::write(dir.join(".hidden"), vec![3u8; 10]).unwrap();
+        assert_eq!(walk_dir(&dir, usize::MAX, false), (150, 2));
+        assert_eq!(walk_dir(&dir, usize::MAX, true), (160, 3));
+        let sized = dir_size_value(&dir, &json!({ "deep": { "maxDepth": 1 }, "dot": false }));
+        assert_eq!(sized["totalSize"], json!(150));
+        assert_eq!(sized["tree"].as_array().map(|t| t.len()), Some(2));
+        // A plain path with no wildcard walks directly instead of matching nothing.
+        // (`dir_size_glob` counts dotfiles like the official glob walk does.)
+        assert_eq!(dir_size_glob(&dir.to_string_lossy()), (160, 3));
+        let pattern = format!("{}/*.bin", dir.to_string_lossy());
+        assert_eq!(dir_size_glob(&pattern), (100, 1));
+        let pattern = format!("{}/**/*.bin", dir.to_string_lossy());
+        assert_eq!(fast_glob_value(&pattern, &json!({})).as_array().map(|a| a.len()), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_delete_and_listing_ops_cover_cache_cleanup() {
+        let dir = std::env::temp_dir().join(format!("olaz-fsops-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bridge = Bridge::new(dir.clone(), "694".into(), false, Arc::new(Events::new()));
+        let target = dir.join("conv");
+        std::fs::create_dir_all(target.join("thumb")).unwrap();
+        std::fs::write(target.join("thumb").join("a.jpg"), b"x").unwrap();
+        let path = json!(target.to_string_lossy());
+        assert_eq!(
+            bridge.fs_call("$znode.fsExtra.pathExists", &[path.clone()]).unwrap(),
+            json!(true)
+        );
+        let missing = json!(target.join("missing").to_string_lossy());
+        assert_eq!(bridge.fs_call("$znode.fsExtra.pathExists", &[missing]).unwrap(), json!(false));
+        assert_eq!(
+            bridge
+                .fs_call("$znode.fs.readdir", &[path.clone(), json!({ "withFileTypes": true })])
+                .unwrap(),
+            json!([{ "name": "thumb", "isFile": false, "isDirectory": true, "isSymbolicLink": false }])
+        );
+        assert_eq!(bridge.fs_call("$znode.fs.readdir", &[path.clone()]).unwrap(), json!(["thumb"]));
+        bridge
+            .fs_call("$znode.fs.rmdir", &[path.clone(), json!({ "recursive": true })])
+            .unwrap();
+        assert!(!target.exists());
+        // Without `recursive` a non-empty dir fails exactly like Node's rmdir.
+        std::fs::create_dir_all(target.join("thumb")).unwrap();
+        assert!(bridge.fs_call("$znode.fs.rmdir", &[path.clone()]).is_err());
+        bridge.member("$znode.rimraf", &[path], false).unwrap();
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_local_resource_folder_empties_and_reports_success() {
+        let dir = std::env::temp_dir().join(format!("olaz-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("f.bin"), b"data").unwrap();
+        assert_eq!(
+            exec_raw("cleanLocalResourceFolder", json!([dir.to_string_lossy()])).unwrap(),
+            json!(0)
+        );
+        assert!(dir.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert_eq!(
+            exec_raw("cleanLocalResourceFolder", json!([dir.join("nope").to_string_lossy()])).unwrap(),
+            json!(0)
+        );
+        assert!(exec_raw("cleanLocalResourceFolder", json!([""])).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_memory_reads_real_rss() {
+        let (rss, peak) = process_memory();
+        assert!(rss > 0, "VmRSS phải đọc được số thật");
+        assert!(peak >= rss);
+        let metric = process_metric(123);
+        assert_eq!(metric[0]["pid"], json!(123));
+        // RSS moves between two reads (the metric itself allocates), so only
+        // check it stays a real, same-order-of-magnitude number.
+        let reported = metric[0]["memory"]["workingSetSize"].as_u64().unwrap();
+        assert!(reported > 0);
+        assert!(reported.abs_diff(rss) < 16 * 1024 * 1024);
     }
 }
 

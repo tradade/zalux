@@ -166,7 +166,8 @@ enum Command {
     SendToNative { json: String, optional: bool },
     Init(Option<String>),
     Reset,
-    /// Người dùng từ chối cuộc gọi đến (banner in-page, virtual mode).
+    /// Người dùng từ chối cuộc gọi đến (banner in-page): virtual mode gửi
+    /// 405/12437 qua `decline_incoming`, zrtc mode qua `engine.reject`.
     Decline,
     /// Người dùng nhận cuộc gọi đến (zrtc engine mode).
     Accept,
@@ -361,13 +362,29 @@ fn handle(state: &mut State, events: &Events, debug: bool, tx: &Sender<Command>,
             Mode::Off => {}
         },
         Command::Init(json) => state.init_json = json,
-        Command::Reset => reset(state, debug),
-        Command::Decline => decline_incoming(state, events, debug),
+        Command::Reset => reset(state, events, debug),
+        Command::Decline => match state.mode {
+            // zrtc engine tự từ chối qua máy trạng thái (402 status 3, nhóm
+            // qua 12436) — trước đây rơi vào nhánh virtual và bị bỏ lặng.
+            Mode::Zrtc => {
+                if let Some(engine) = &mut state.zrtc {
+                    let now = now_ms();
+                    engine_out(events, engine.reject(now, "user"));
+                } else {
+                    eprintln!("[call] từ chối: engine chưa sẵn sàng (renderer chưa gửi init)");
+                }
+            }
+            _ => decline_incoming(state, events, debug),
+        },
         Command::Accept => {
             if let Some(engine) = &mut state.zrtc {
                 let now = now_ms();
                 let out = engine.accept(now);
                 engine_out(events, out);
+            } else if state.mode == Mode::Virtual {
+                // Helper nội bộ không có media nên không thể nhận máy — đây là
+                // giới hạn thiết kế, log luôn để bản release cũng thấy.
+                eprintln!("[call] nhận máy: cần OLAZ_CALL_ENGINE=zrtc để nhận máy thật");
             }
         }
         Command::CallControl(data) => {
@@ -503,6 +520,11 @@ fn virtual_message(state: &mut State, events: &Events, debug: bool, json: String
     let kind = message.get("type").and_then(Value::as_str).unwrap_or("");
     let command = message.get("command").and_then(Value::as_str).unwrap_or("");
     match (kind, command) {
+        // Helper nội bộ không đặt cuộc gọi được: log rõ thay vì treo lặng
+        // (adapter báo lạc quan `started`, renderer thì chờ response/show).
+        ("request", "makeCall" | "endCall") => {
+            eprintln!("[call] gọi đi: helper nội bộ chỉ từ chối — bật OLAZ_CALL_ENGINE=zrtc để gọi/nhận máy thật");
+        }
         // init data chứa `_getDefaultDevices()` — giữ lại để trả `listDevice`.
         ("update", "init" | "updateLocal") => {
             if let Some(data) = message.get("data") {
@@ -539,6 +561,28 @@ fn virtual_control(state: &mut State, events: &Events, debug: bool, message: Val
             let Some(data) = control.get("data") else {
                 return;
             };
+            // Đang reo/bận cuộc khác: retransmit cùng callId thì bỏ qua,
+            // cuộc mới khác id thì auto-decline, giữ nguyên cuộc đang reo.
+            if let Some(current) = &state.virtual_incoming {
+                let same = match (
+                    current.get("data").and_then(|d| d.get("callId")).filter(|v| !v.is_null()),
+                    data.get("callId").filter(|v| !v.is_null()),
+                ) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => false,
+                };
+                if same {
+                    return;
+                }
+                match virtual_decline_payload(&control) {
+                    Some((code, payload)) => {
+                        emit(events, "call-send-signal", &[json!(code), payload]);
+                        eprintln!("[call] đang bận — đã tự từ chối cuộc gọi mới");
+                    }
+                    None => eprintln!("[call] đang bận nhưng control mới thiếu callId — không từ chối được"),
+                }
+                return;
+            }
             state.virtual_incoming = Some(control.clone());
             // Helper thật cũng reo: renderer coi như đang trong cuộc gọi.
             emit(events, "call-update", &[json!("callState"), json!({ "state": "incall" })]);
@@ -562,25 +606,12 @@ fn virtual_control(state: &mut State, events: &Events, debug: bool, message: Val
     }
 }
 
-/// Từ chối cuộc gọi đến đang reo: gửi signal 405 (1-1) / 12437 (nhóm) —
-/// renderer relay lên server qua realtime (`sendCancelCall` /
-/// `sendCancelCallGroup`), đúng như helper thật làm.
-fn decline_incoming(state: &mut State, events: &Events, debug: bool) {
-    if state.mode != Mode::Virtual {
-        // Helper ngoài tự vẽ cửa sổ thoại và tự xử lý.
-        log(debug, "call: từ chối chỉ dùng với helper nội bộ");
-        return;
-    }
-    let Some(control) = state.virtual_incoming.take() else {
-        return;
-    };
-    let Some(data) = control.get("data") else {
-        return;
-    };
-    let Some(call_id) = data.get("callId").filter(|value| !value.is_null()) else {
-        log(debug, "call: không có callId trong control — bỏ qua từ chối");
-        return;
-    };
+/// Dựng signal từ chối cho một control request mà KHÔNG chạm state: dùng cho
+/// từ chối cuộc đang reo lẫn auto-decline khi bận (không emit `free` — cuộc
+/// hiện tại vẫn sống, chỉ báo cho server biết cuộc mới bị từ chối).
+fn virtual_decline_payload(control: &Value) -> Option<(i64, Value)> {
+    let data = control.get("data")?;
+    let call_id = data.get("callId").filter(|value| !value.is_null())?.clone();
     let to_id = first_string(data, &["uidN", "fromUid", "uid"]);
     let call_type = data
         .get("callType")
@@ -589,7 +620,7 @@ fn decline_incoming(state: &mut State, events: &Events, debug: bool) {
         .unwrap_or(Value::Null);
     let is_group = control.get("act").and_then(Value::as_str) == Some("group_request")
         || to_id.starts_with('g');
-    let (code, payload) = if is_group {
+    Some(if is_group {
         (
             12437,
             json!({
@@ -606,10 +637,37 @@ fn decline_incoming(state: &mut State, events: &Events, debug: bool) {
             405,
             json!({ "toId": to_id, "callId": call_id, "callType": call_type }),
         )
+    })
+}
+
+/// Từ chối cuộc gọi đến đang reo: gửi signal 405 (1-1) / 12437 (nhóm) —
+/// renderer relay lên server qua realtime (`sendCancelCall` /
+/// `sendCancelCallGroup`), đúng như helper thật làm.
+fn decline_incoming(state: &mut State, events: &Events, debug: bool) {
+    if state.mode != Mode::Virtual {
+        // Helper ngoài tự vẽ cửa sổ thoại và tự xử lý; zrtc mode đi nhánh
+        // engine riêng. Log luôn để bản release cũng thấy nút chết ở đâu.
+        eprintln!("[call] từ chối: chỉ dùng với helper nội bộ (mode hiện tại không phải virtual)");
+        return;
+    }
+    let Some(control) = state.virtual_incoming.take() else {
+        eprintln!("[call] từ chối: không có cuộc gọi đến đang reo (control request chưa tới)");
+        return;
     };
-    emit(events, "call-send-signal", &[json!(code), payload]);
-    emit(events, "call-update", &[json!("callState"), json!({ "state": "free" })]);
-    log(debug, "call: đã từ chối cuộc gọi đến");
+    match virtual_decline_payload(&control) {
+        Some((code, payload)) => {
+            emit(events, "call-send-signal", &[json!(code), payload]);
+            emit(events, "call-update", &[json!("callState"), json!({ "state": "free" })]);
+            log(debug, "call: đã từ chối cuộc gọi đến");
+        }
+        None => {
+            if control.get("data").is_none() {
+                eprintln!("[call] từ chối: control request thiếu data");
+            } else {
+                eprintln!("[call] từ chối: control request thiếu callId — không gửi được 405");
+            }
+        }
+    }
 }
 
 /// zrtc engine mode: xử lý message renderer (init/makeCall/control) qua engine.
@@ -649,6 +707,22 @@ fn zrtc_message(state: &mut State, events: &Events, debug: bool, json: String) {
             let out = engine.handle_control(now, act, control);
             engine_out(events, out);
         }
+        ("recvSignal", _) => {
+            // Relay trả lời signal của ta (servers/sessId của 401, session của
+            // 12433, ping 12097): engine xử lý — trước đây rơi vào `_` nên
+            // gọi đi/group liệt hoàn toàn ở zrtc mode.
+            let code = match message.get("command") {
+                Some(Value::String(text)) => text.clone(),
+                Some(Value::Number(number)) => number.to_string(),
+                _ => String::new(),
+            };
+            let out = engine.handle_recv_signal(
+                now,
+                &code,
+                &message.get("data").cloned().unwrap_or(Value::Null),
+            );
+            engine_out(events, out);
+        }
         ("response", "getAliasName") => {
             // Alias hiển thị — phase sau; signalling không phụ thuộc.
         }
@@ -666,7 +740,17 @@ fn zrtc_tick(state: &mut State, events: &Events, debug: bool) {
             crate::zrtc::media::MediaEvent::EarlyAudio(phase) => engine.early_audio(now, phase),
             crate::zrtc::media::MediaEvent::GroupRoster(roster) => engine.group_roster(now, &roster),
             crate::zrtc::media::MediaEvent::Fault(kind) => {
-                log(debug, &format!("call: audio fault ({kind}) — call vẫn tiếp tục nhận-only"));
+                // Hỏng thiết bị giữa cuộc gọi: call tiếp tục (bên kia vẫn nghe
+                // nếu chỉ hỏng loa), nhưng phải báo cho người dùng biết.
+                log(debug, &format!("call: audio fault ({kind}) — call vẫn tiếp tục, đã báo UI"));
+                vec![crate::zrtc::engine::Out::Ui(crate::zrtc::engine::UiEvent::Status(
+                    fault_status(kind),
+                ))]
+            }
+            crate::zrtc::media::MediaEvent::RemoteVideo { jpeg } => {
+                // Ảnh bên kia (~2 fps) cho panel in-call của call-ui.js.
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+                emit(events, "call-video", &[json!({"jpeg": b64})]);
                 vec![]
             }
         };
@@ -674,6 +758,15 @@ fn zrtc_tick(state: &mut State, events: &Events, debug: bool) {
     }
     let out = engine.tick(now);
     engine_out(events, out);
+}
+
+/// Lỗi thiết bị giữa cuộc gọi → mã trạng thái cho panel in-call.
+fn fault_status(kind: &str) -> String {
+    match kind {
+        "mic" => "micUnavailable".into(),
+        "speaker" => "speakerUnavailable".into(),
+        _ => "audioUnavailable".into(),
+    }
 }
 
 /// Map engine events onto the existing bridge channels.
@@ -800,7 +893,7 @@ fn start_native(state: &mut State, events: &Events, debug: bool, tx: &Sender<Com
     }
 }
 
-fn reset(state: &mut State, debug: bool) {
+fn reset(state: &mut State, events: &Events, debug: bool) {
     // zrtc engine: logout/reset → dừng media + xoá máy trạng thái (lần init
     // sau sẽ tạo lại).
     state.zrtc = None;
@@ -809,6 +902,9 @@ fn reset(state: &mut State, debug: bool) {
     state.pending.clear();
     state.virtual_devices = None;
     state.virtual_incoming = None;
+    // Đang trong cuộc gọi mà reset (logout): renderer phải về free, nếu không
+    // banner/panel treo (kèm hideBanner qua call-update ở call-ui.js).
+    emit(events, "call-update", &[json!("callState"), json!({ "state": "free" })]);
     state.generation += 1;
     if let Some(mut child) = state.helper.take() {
         state.started = false;
@@ -1079,5 +1175,201 @@ fn route(state: &mut State, events: &Events, debug: bool, message: Value) {
             emit(events, &channel, &[data]);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn drive(state: &mut State, events: &Arc<Events>, command: Command) {
+        let (tx, _rx) = mpsc::channel::<Command>();
+        handle(state, events, false, &tx, command);
+    }
+
+    fn fresh_events() -> Arc<Events> {
+        Arc::new(Events::new())
+    }
+
+    fn drain(events: &Arc<Events>) -> Vec<Value> {
+        events.drain_all()
+    }
+
+    fn find_send(events_list: &[Value], code: i64) -> Option<Value> {
+        events_list.iter().find_map(|event| {
+            let channel = event.get("channel")?.as_str()?;
+            if channel != "call-send-signal" {
+                return None;
+            }
+            let args = event.get("args")?.as_array()?;
+            if args.first()?.as_i64() == Some(code) {
+                Some(args.get(1).cloned().unwrap_or(Value::Null))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Khung control `request` như renderer gửi khi có cuộc gọi đến
+    /// (phone → PC): `{type:"control", data:{act, data:{uidN, callId…}}}`.
+    fn incoming_request_json() -> String {
+        json!({
+            "type": "control",
+            "data": {
+                "act_type": "voip",
+                "act": "request",
+                "data": {
+                    "uidN": "123456",
+                    "callId": 78901234,
+                    "callType": 1,
+                    "params": {"Dname": "Mẹ", "avatar": "", "sessId": "sess-1"},
+                },
+                "ts": 1_700_000_000_000u64,
+            },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn virtual_decline_sends_405_with_call_id() {
+        let events = fresh_events();
+        let mut state = State::new(Mode::Virtual);
+        drive(&mut state, &events, Command::SendToNative { json: incoming_request_json(), optional: false });
+        drive(&mut state, &events, Command::Decline);
+        let got = drain(&events);
+        let payload = find_send(&got, 405).expect("thiếu signal 405 từ chối");
+        assert_eq!(payload.get("toId").and_then(Value::as_str), Some("123456"));
+        assert_eq!(payload.get("callId").and_then(Value::as_i64), Some(78901234));
+        // Trạng thái renderer về free sau khi từ chối.
+        assert!(got.iter().any(|event| event.get("channel").and_then(Value::as_str) == Some("call-update")
+            && event.get("args").and_then(|a| a.as_array()).is_some_and(|a| a.first().and_then(Value::as_str) == Some("callState"))));
+    }
+
+    #[test]
+    fn zrtc_decline_sends_402_status_3() {
+        let events = fresh_events();
+        let mut state = State::new(Mode::Zrtc);
+        // init đầu tiên dựng engine (cần local id cho 401/extendData).
+        drive(
+            &mut state,
+            &events,
+            Command::SendToNative {
+                json: json!({"type": "update", "command": "init", "data": {"id": 1, "avatar": "me"}}).to_string(),
+                optional: false,
+            },
+        );
+        assert!(state.zrtc.is_some(), "engine phải được dựng sau init");
+        drive(&mut state, &events, Command::SendToNative { json: incoming_request_json(), optional: false });
+        drive(&mut state, &events, Command::Decline);
+        let got = drain(&events);
+        let payload = find_send(&got, 402).expect("thiếu signal 402 từ chối (zrtc)");
+        assert_eq!(payload.get("status").and_then(Value::as_i64), Some(3));
+        assert_eq!(payload.get("callId").and_then(Value::as_i64), Some(78901234));
+    }
+
+    #[test]
+    fn virtual_accept_without_engine_emits_nothing() {
+        // Helper nội bộ không có media: nhận máy là no-op có log (không treo,
+        // không gửi signal nửa vời).
+        let events = fresh_events();
+        let mut state = State::new(Mode::Virtual);
+        drive(&mut state, &events, Command::Accept);
+        assert!(drain(&events).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn drive(state: &mut State, events: &Arc<Events>, command: Command) {
+        let (tx, _rx) = mpsc::channel::<Command>();
+        handle(state, events, false, &tx, command);
+    }
+
+    fn request_with(call_id: i64, uid: &str) -> String {
+        json!({
+            "type": "control",
+            "data": {
+                "act_type": "voip",
+                "act": "request",
+                "data": {"uidN": uid, "callId": call_id, "callType": 1, "params": {}},
+                "ts": 1_700_000_000_000u64,
+            },
+        })
+        .to_string()
+    }
+
+    fn find_send(events_list: &[Value], code: i64) -> Option<Value> {
+        events_list.iter().find_map(|event| {
+            if event.get("channel")?.as_str()? != "call-send-signal" {
+                return None;
+            }
+            let args = event.get("args")?.as_array()?;
+            if args.first()?.as_i64() == Some(code) {
+                Some(args.get(1).cloned().unwrap_or(Value::Null))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Gọi đi ở zrtc mode: relay trả 401 (command SỐ, đúng renderer gửi) qua
+    /// recvSignal phải tới được engine — trước đây rơi vào `_` → kẹt Calling.
+    #[test]
+    fn zrtc_recv_signal_numeric_401_reaches_engine() {
+        let events = Arc::new(Events::new());
+        let mut state = State::new(Mode::Zrtc);
+        drive(&mut state, &events, Command::SendToNative {
+            json: json!({"type": "update", "command": "init", "data": {"id": 1}}).to_string(),
+            optional: false,
+        });
+        drive(&mut state, &events, Command::SendToNative {
+            json: json!({"type": "request", "command": "makeCall",
+                         "data": {"type": 1, "partner": [{"id": "5678", "name": "Lan"}]}}).to_string(),
+            optional: false,
+        });
+        let got = events.drain_all();
+        assert!(find_send(&got, 401).is_some(), "thiếu signal 401 gọi đi");
+        // Relay trả servers/sessId với command là số 401 (như renderer gửi).
+        drive(&mut state, &events, Command::SendToNative {
+            json: json!({"type": "recvSignal", "command": 401, "data": {
+                "servers": [{"rtpaddr": "203.0.113.9|5000", "rtcpaddr": "203.0.113.9|5001"}],
+                "sessId": "sess-1", "fromId": 1, "toId": 5678}}).to_string(),
+            optional: false,
+        });
+        let call = state.zrtc.as_ref().and_then(|e| e.call.as_ref()).expect("engine mất call");
+        assert!(
+            call.server.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "engine chưa nạp servers từ recvSignal 401"
+        );
+    }
+
+    /// Virtual mode đang reo: retransmit cùng callId thì bỏ qua, cuộc mới
+    /// khác id thì auto-decline 405, cuộc cũ còn nguyên để từ chối sau.
+    #[test]
+    fn virtual_busy_auto_declines_only_new_call() {
+        let events = Arc::new(Events::new());
+        let mut state = State::new(Mode::Virtual);
+        drive(&mut state, &events, Command::SendToNative { json: request_with(111, "123"), optional: false });
+        drive(&mut state, &events, Command::SendToNative { json: request_with(111, "123"), optional: false });
+        assert!(find_send(&events.drain_all(), 405).is_none(), "retransmit không được phát signal");
+        drive(&mut state, &events, Command::SendToNative { json: request_with(222, "999"), optional: false });
+        let got = events.drain_all();
+        let busy = find_send(&got, 405).expect("thiếu 405 auto-decline cuộc mới");
+        assert_eq!(busy.get("callId").and_then(Value::as_i64), Some(222));
+        // Cuộc đầu vẫn còn: từ chối ra đúng 405 của nó.
+        drive(&mut state, &events, Command::Decline);
+        let got = events.drain_all();
+        assert_eq!(find_send(&got, 405).expect("mất 405 cuộc đầu").get("callId").and_then(Value::as_i64), Some(111));
+    }
+
+    #[test]
+    fn fault_status_maps_device_direction() {
+        assert_eq!(fault_status("mic"), "micUnavailable");
+        assert_eq!(fault_status("speaker"), "speakerUnavailable");
+        assert_eq!(fault_status("other"), "audioUnavailable");
     }
 }

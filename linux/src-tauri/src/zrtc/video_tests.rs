@@ -137,3 +137,31 @@ fn assembler_matches_vectors_1_1() {
 fn assembler_matches_vectors_group() {
     run_assembler(true);
 }
+
+/// Encoder thật → bitstream Annex-B → renderer ra JPEG (SOI magic + throttle
+/// 500 ms). Không cần golden file: encoder OpenH264 bundle sinh tại chỗ.
+#[test]
+fn renderer_decodes_encoder_stream_to_jpeg() {
+    use openh264::encoder::{Encoder, EncoderConfig};
+    use openh264::formats::{RgbSliceU8, YUVBuffer};
+    let (w, h) = (128usize, 128usize);
+    let rgb: Vec<u8> = (0..w * h)
+        .flat_map(|i| {
+            let x = (i % w) as u8;
+            let y = (i / w) as u8;
+            [x.wrapping_mul(2), y.wrapping_mul(2), 128u8]
+        })
+        .collect();
+    let yuv = YUVBuffer::from_rgb_source(RgbSliceU8::new(&rgb, (w, h)));
+    let mut enc = Encoder::with_api_config(openh264::OpenH264API::from_source(), EncoderConfig::new()).unwrap();
+    let bytes = enc.encode(&yuv).unwrap().to_vec();
+    assert!(!bytes.is_empty(), "encoder không ra bitstream");
+    let mut r = FrameRenderer::new();
+    let jpeg = r.push(&VideoFrame { key: true, data: bytes, ts: 90_000 }, 0.0).expect("decode ra JPEG");
+    assert_eq!(&jpeg[0..2], &[0xFF, 0xD8], "thiếu SOI magic");
+    assert!(jpeg.len() > 1_000, "JPEG rỗng đáng ngờ");
+    // Frame tới ngay sau (< 500 ms) bị throttle nuốt dù decode được.
+    assert!(r.push(&VideoFrame { key: false, data: vec![0, 0, 0, 1, 6, 5], ts: 90_003 }, 100.0).is_none());
+    // Qua 500 ms mà không có hình mới (SEI lẻ) vẫn là None, không crash.
+    assert!(r.push(&VideoFrame { key: false, data: vec![0, 0, 0, 1, 6, 5], ts: 90_006 }, 600.0).is_none());
+}

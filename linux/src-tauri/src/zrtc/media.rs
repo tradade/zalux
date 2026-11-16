@@ -20,7 +20,7 @@ use super::engine::{InitReply, Media, NegotiatedParams, Role};
 use super::rtcp::{build_pli, RtcpFeedback};
 use super::rtp::{self, RtpHeaderArgs};
 use super::srtp::{self, SrtpKeys};
-use super::video::{VideoAssembler, VideoFrame, VideoPacket};
+use super::video::{FrameRenderer, VideoAssembler, VideoFrame, VideoPacket};
 use super::wire::{self, msg_type, unwrap_packet};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -33,6 +33,22 @@ use std::time::{Duration, Instant};
 const REG_ROUNDS: usize = 3;
 const REG_ROUND_MS: u64 = 200;
 const REG_WINDOW_MS: u64 = 600;
+
+/// Probe chatter (`[zrtc-debug]`) chỉ hiện khi `OLAZ_DEBUG=1`: bản release mỗi
+/// lần đăng ký relay spam hàng chục dòng mà không giúp gì cho người dùng.
+static ZRTC_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn zrtc_debug() -> bool {
+    *ZRTC_DEBUG.get_or_init(|| std::env::var("OLAZ_DEBUG").map(|v| v != "0").unwrap_or(false))
+}
+
+macro_rules! zdbg {
+    ($($arg:tt)*) => {
+        if crate::zrtc::media::zrtc_debug() {
+            eprintln!($($arg)*);
+        }
+    };
+}
 const PING_EVERY_MS: u64 = 5_000;
 const TWCC_EVERY_MS: u64 = 50;
 const SR_EVERY_MS: u64 = 1_000;
@@ -54,6 +70,8 @@ pub enum MediaEvent {
     EarlyAudio(&'static str),
     /// A device direction died mid-call.
     Fault(&'static str),
+    /// Remote video snapshot (JPEG) for the in-call panel, throttled ~2 fps.
+    RemoteVideo { jpeg: Vec<u8> },
 }
 
 pub struct ZrtcMedia {
@@ -63,6 +81,9 @@ pub struct ZrtcMedia {
     /// Sent/received SRTP payload counts, for the 406 stats.
     pub tx: Arc<AtomicU64>,
     pub rx: Arc<AtomicU64>,
+    /// Mốc RX đã giải mã gần nhất (ms epoch) — engine dùng để biết media
+    /// còn chảy khi relay báo ping lỗi (thay vì finish oan).
+    last_rx_ms: Arc<AtomicU64>,
 }
 
 impl ZrtcMedia {
@@ -72,12 +93,13 @@ impl ZrtcMedia {
         let udp_ok = Arc::new(AtomicBool::new(true));
         let tx = Arc::new(AtomicU64::new(0));
         let rx = Arc::new(AtomicU64::new(0));
-        let flags = (udp_ok.clone(), tx.clone(), rx.clone());
+        let last_rx_ms = Arc::new(AtomicU64::new(0));
+        let flags = (udp_ok.clone(), tx.clone(), rx.clone(), last_rx_ms.clone());
         std::thread::Builder::new()
             .name("zrtc-media".into())
             .spawn(move || media_loop(job_rx, event_tx, flags))
             .expect("spawn zrtc-media worker");
-        Self { jobs, events, udp_ok, tx, rx }
+        Self { jobs, events, udp_ok, tx, rx, last_rx_ms }
     }
 
     /// Drains pending media events (the engine worker calls this each turn).
@@ -109,6 +131,14 @@ impl Media for ZrtcMedia {
 
     fn send_udp(&self) -> bool {
         self.udp_ok.load(Ordering::Relaxed)
+    }
+
+    fn rx_idle_ms(&self, now_ms: f64) -> Option<f64> {
+        let last = self.last_rx_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return None;
+        }
+        Some(now_ms - last as f64)
     }
 
     fn stats(&self) -> (u64, u64) {
@@ -178,8 +208,12 @@ impl Roc {
     }
 }
 
-fn media_loop(jobs: mpsc::Receiver<Job>, events: mpsc::Sender<MediaEvent>, flags: (Arc<AtomicBool>, Arc<AtomicU64>, Arc<AtomicU64>)) {
-    let (udp_ok, tx_counter, rx_counter) = flags;
+fn media_loop(
+    jobs: mpsc::Receiver<Job>,
+    events: mpsc::Sender<MediaEvent>,
+    flags: (Arc<AtomicBool>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>),
+) {
+    let (udp_ok, tx_counter, rx_counter, last_rx_shared) = flags;
     let mut negotiated: Option<NegotiatedParams> = None;
     let mut socket: Option<UdpSocket> = None;
     let mut servers: Vec<RelayServer> = Vec::new();
@@ -197,6 +231,13 @@ fn media_loop(jobs: mpsc::Receiver<Job>, events: mpsc::Sender<MediaEvent>, flags
     let mic_ring = PcmRing::new(SAMPLE_RATE as usize / 5); // 200 ms
     let spk_ring = PcmRing::new(SAMPLE_RATE as usize / 3); // ~333 ms
     let mut audio: Option<AudioIo> = None;
+    // Device health: cpal error callbacks (unplug/revoke) + mic-callback
+    // watchdog (callback từng chạy mà ngừng, không phải lúc nào cũng error).
+    let mut audio_fault_rx: Option<mpsc::Receiver<Direction>> = None;
+    let mic_activity = Arc::new(AtomicU64::new(0));
+    let mut mic_flow_seen = false;
+    let mut mic_dead = false;
+    let mut call_start_ms: u64 = 0;
     let mut rtcp: Option<RtcpFeedback> = None;
     let mut videos: HashMap<u32, VideoAssembler> = HashMap::new();
     let mut last_video_gaps: HashMap<u32, i32> = HashMap::new();
@@ -246,7 +287,7 @@ fn media_loop(jobs: mpsc::Receiver<Job>, events: mpsc::Sender<MediaEvent>, flags
                     vec![None]
                 };
                 'layouts: for layout in &group_layouts {
-                eprintln!("[zrtc-debug] probe layout {:?}", layout);
+                zdbg!("[zrtc-debug] probe layout {:?}", layout);
                 let init_pkt = match layout {
                     Some(l) => wire::build_group_init_zrtp_packet(params.host, uid, params.sess_id.as_bytes(), false, call_id, (params.host_call as u32) & 0xffff_ffff, l),
                     None => wire::build_init_zrtp_packet(role == Role::Caller, uid, peer_uid, call_id, params.sess_id.as_bytes()),
@@ -268,8 +309,8 @@ fn media_loop(jobs: mpsc::Receiver<Job>, events: mpsc::Sender<MediaEvent>, flags
                         let mut buf = [0u8; 1500];
                         match sock.recv_from(&mut buf) {
                             Ok((n, from)) => {
-                                let Some(p) = unwrap_packet(&buf[..n]) else { eprintln!("[zrtc-debug] probe rx: unwrap None"); continue };
-                                eprintln!("[zrtc-debug] probe rx: type={} res={:?} callId={:?} from={}", p.msg_type, p.res, p.call_id, from);
+                                let Some(p) = unwrap_packet(&buf[..n]) else { zdbg!("[zrtc-debug] probe rx: unwrap None"); continue };
+                                zdbg!("[zrtc-debug] probe rx: type={} res={:?} callId={:?} from={}", p.msg_type, p.res, p.call_id, from);
                                 if p.msg_type != msg_type::SERVER_REPLY || p.res != Some(0) {
                                     continue;
                                 }
@@ -293,7 +334,7 @@ fn media_loop(jobs: mpsc::Receiver<Job>, events: mpsc::Sender<MediaEvent>, flags
                         break 'rounds; // one good reply after a retry round is enough
                     }
                 }
-                eprintln!("[zrtc-debug] layout {:?} matched {} reply", layout, matched.len());
+                zdbg!("[zrtc-debug] layout {:?} matched {} reply", layout, matched.len());
                 if matched.is_empty() {
                     continue 'layouts; // thử layout kế
                 }
@@ -350,7 +391,12 @@ fn media_loop(jobs: mpsc::Receiver<Job>, events: mpsc::Sender<MediaEvent>, flags
                 if let Some(p) = &negotiated {
                     rtcp = Some(RtcpFeedback::new((p.local_uid as u32) & 0xffff_ffff));
                 }
-                match AudioIo::open(mic_ring.clone(), spk_ring.clone()) {
+                let (fault_tx, fault_rx) = mpsc::channel();
+                audio_fault_rx = Some(fault_rx);
+                mic_flow_seen = false;
+                mic_dead = false;
+                call_start_ms = now_ms() as u64;
+                match AudioIo::open(mic_ring.clone(), spk_ring.clone(), &fault_tx, &mic_activity) {
                     Ok(io) => audio = Some(io),
                     Err((dir, e)) => {
                         eprintln!("[olaz] zrtc media: audio {dir:?}: {e}");
@@ -365,6 +411,9 @@ fn media_loop(jobs: mpsc::Receiver<Job>, events: mpsc::Sender<MediaEvent>, flags
             Ok(Job::Stop) => {
                 active = None;
                 audio = None;
+                audio_fault_rx = None;
+                mic_flow_seen = false;
+                mic_dead = false;
                 while jitter.pop().is_some() {}
                 rtcp = None;
                 videos.clear();
@@ -376,6 +425,27 @@ fn media_loop(jobs: mpsc::Receiver<Job>, events: mpsc::Sender<MediaEvent>, flags
         }
 
         let Some(role) = active else { continue };
+        // Device health giữa cuộc gọi: error callback của cpal + watchdog khi
+        // callback capture từng chạy mà ngừng (rút mic/thu hồi quyền).
+        if let Some(rx) = &audio_fault_rx {
+            for dir in rx.try_iter() {
+                let _ = events.send(MediaEvent::Fault(match dir {
+                    Direction::Mic => "mic",
+                    Direction::Speaker => "speaker",
+                }));
+            }
+        }
+        if !mic_dead {
+            let last_mic = mic_activity.load(Ordering::Relaxed);
+            if last_mic != 0 {
+                mic_flow_seen = true;
+            }
+            let now_u = now_ms() as u64;
+            if mic_starved(mic_flow_seen, last_mic, now_u, now_u.saturating_sub(call_start_ms)) {
+                mic_dead = true;
+                let _ = events.send(MediaEvent::Fault("mic"));
+            }
+        }
         let Some(sock) = &socket else { continue };
         let Some(params) = &negotiated else { continue };
         let idx = best_idx.unwrap_or(0);
@@ -497,6 +567,7 @@ fn media_loop(jobs: mpsc::Receiver<Job>, events: mpsc::Sender<MediaEvent>, flags
             match sock.recv_from(&mut buf) {
                 Ok((n, _from)) => {
                     last_rx = Instant::now();
+                    last_rx_shared.store(now_ms() as u64, Ordering::Relaxed);
                     let Some(p) = unwrap_packet(&buf[..n]) else { continue };
                     // Group roster: RoomUpdated (cmd 50) reply body = uid LE32 list.
                     if p.is_control && p.cmd == wire::cmd::ROOM_UPDATED {
@@ -545,14 +616,24 @@ fn media_loop(jobs: mpsc::Receiver<Job>, events: mpsc::Sender<MediaEvent>, flags
                         continue;
                     }
                     if video {
-                        // Video RX: assemble → RTCP stats + PLI on gaps.
-                        // Rendering needs a decoder (OpenH264) this build
-                        // doesn't bundle — the call stays audio-only.
+                        // Video RX: assemble → decode (OpenH264) → JPEG cho
+                        // panel in-call; RTCP stats + PLI on gaps như cũ.
                         let pt = (u8_at(&p.payload, 1) & 0x7f) as i32;
                         let marker = (u8_at(&p.payload, 1) & 0x80) != 0;
                         let pkt = VideoPacket { seq, ts: srtp::rd32be(&p.payload, 4), pt, marker, payload: open.payload, roc, ssrc };
                         videos.entry(ssrc).or_insert_with(|| {
-                            VideoAssembler::new(Box::new(|_f: VideoFrame| {}), now_ms, false, Box::new(|| {}))
+                            let ev = events.clone();
+                            let mut render = FrameRenderer::new();
+                            VideoAssembler::new(
+                                Box::new(move |f: VideoFrame| {
+                                    if let Some(jpeg) = render.push(&f, now_ms()) {
+                                        let _ = ev.send(MediaEvent::RemoteVideo { jpeg });
+                                    }
+                                }),
+                                now_ms,
+                                false,
+                                Box::new(|| {}),
+                            )
                         });
                         if let Some(asm) = videos.get_mut(&ssrc) {
                             asm.push(pkt);
@@ -610,4 +691,33 @@ fn media_loop(jobs: mpsc::Receiver<Job>, events: mpsc::Sender<MediaEvent>, flags
 
 fn now_ms() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0)
+}
+
+/// Mic watchdog thuần: mic đã từng capture mà ngừng quá 3 s sau khi cuộc gọi
+/// lên quá 8 s → coi như thiết bị chết (rút mic / thu hồi quyền không báo
+/// stream error). Media thread latch một lần mỗi cuộc gọi (`mic_dead`).
+pub(crate) fn mic_starved(seen: bool, last_mic_ms: u64, now_ms: u64, call_up_ms: u64) -> bool {
+    const ARM_MS: u64 = 8_000;
+    const GRACE_MS: u64 = 3_000;
+    seen && call_up_ms > ARM_MS && now_ms.saturating_sub(last_mic_ms) > GRACE_MS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mic_starved;
+
+    #[test]
+    fn watchdog_arms_only_after_flow_and_grace() {
+        // Chưa từng capture: không báo dù cuộc gọi đã lâu (tránh false
+        // positive khi mic bị chặn từ đầu — lỗi đó đã báo lúc open).
+        assert!(!mic_starved(false, 0, 60_000, 60_000));
+        // Cuộc gọi mới lên (< 8 s): cho qua dù mic chưa chạy.
+        assert!(!mic_starved(true, 1_000, 5_000, 4_000));
+        // Đang chảy bình thường: im lặng.
+        assert!(!mic_starved(true, 9_500, 10_000, 10_000));
+        // Từng chạy, ngừng hơn 3 s sau 8 s: chết.
+        assert!(mic_starved(true, 5_000, 12_000, 12_000));
+        // Ngừng chưa tới 3 s: cho qua (glitch ngắn).
+        assert!(!mic_starved(true, 10_000, 12_000, 12_000));
+    }
 }

@@ -13,7 +13,8 @@ DerivedData/
 .claude/
 .vscode/
 .idea/
-
+.issues/
+issues/
 # Fingerprint helper build output (scripts/build-fingerprint-helper.sh)
 FingerprintHelper/build/
 

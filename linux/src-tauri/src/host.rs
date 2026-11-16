@@ -140,6 +140,12 @@ impl Events {
         out
     }
 
+    /// Test-only: takes every queued event without cursor semantics.
+    #[cfg(test)]
+    pub fn drain_all(&self) -> Vec<Value> {
+        self.state.lock().unwrap().1.drain(..).collect()
+    }
+
     /// Events after `cursor`; blocks up to `timeout` for the first one.
     /// `cursor == 0` starts at "now" (a page that just loaded does not replay
     /// pushes aimed at the previous page).

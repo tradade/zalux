@@ -42,6 +42,7 @@ notify-rust = "4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 cpal = "0.15"
 opus = "0.3"
+openh264 = "0.8"
 
 [profile.release]
 opt-level = "s"

@@ -25,7 +25,7 @@ pub const CODEC_VOICE: &str = "[{\"dynamicFptime\":0,\"frmPtime\":20,\"name\":\"
 pub const CODEC_EMPTY: &str = "[]\n";
 
 const CALL_SETUP_TIMEOUT_MS: f64 = 15_000.0;
-const RING_TIMEOUT_MS: f64 = 45_000.0;
+pub(crate) const RING_TIMEOUT_MS: f64 = 45_000.0;
 const ENDED_CALL_TTL_MS: f64 = 60_000.0;
 const MAX_ENDED_CALLS: usize = 256;
 
@@ -185,6 +185,11 @@ pub trait Media {
     /// Whether the backend may actually send UDP (observe-only builds do not).
     fn send_udp(&self) -> bool;
     fn stats(&self) -> (u64, u64);
+    /// Media im lặng bao lâu rồi (ms), `None` khi backend không theo dõi —
+    /// ping lỗi mà media còn chảy thì cuộc gọi được giữ lại.
+    fn rx_idle_ms(&self, _now_ms: f64) -> Option<f64> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -663,7 +668,7 @@ impl<M: Media> Engine<M> {
             let reply = parse_maybe_json_value(data.get("data"));
             let error = reply.get("error").and_then(Value::as_f64).unwrap_or(0.0);
             if self.call.as_ref().is_some_and(|c| c.group && c.state == State::Connected) && error != 0.0 {
-                return self.group_ping_failed(now, error, Some(f64::INFINITY));
+                return self.group_ping_failed(now, error, self.media.rx_idle_ms(now));
             }
             return vec![];
         }
@@ -830,7 +835,32 @@ impl<M: Media> Engine<M> {
             return vec![];
         }
         if self.call.is_some() {
-            return vec![];
+            // Retransmit cùng callId thì bỏ qua; cuộc khác tới khi đang bận
+            // thì auto-decline (402 status 3) thay vì ghi đè cuộc hiện tại.
+            let new_id = num_of(d.get("callId"));
+            let same = new_id != 0.0 && self.call.as_ref().is_some_and(|c| c.call_id == new_id);
+            if same || new_id == 0.0 {
+                return vec![];
+            }
+            let peer = str_or(d.get("uidN"));
+            let sess = if truthy(d.get("session")) {
+                d.get("session").cloned().unwrap()
+            } else {
+                params.get("sessId").cloned().unwrap_or(Value::Null)
+            };
+            return vec![Out::SendSignal {
+                code: 402,
+                data: json!({
+                    "callId": num_json(new_id),
+                    "callerId": peer,
+                    "codec": CODEC_EMPTY,
+                    "extendData": "{}\n",
+                    "rtcpAddress": "",
+                    "rtpAddress": "",
+                    "session": sess,
+                    "status": 3,
+                }),
+            }];
         }
         let server_addr = ext.get("serverAddr").and_then(Value::as_array).and_then(|a| a.first()).cloned().unwrap_or(Value::Null);
         let addr = obj(Some(&server_addr));
@@ -881,7 +911,9 @@ impl<M: Media> Engine<M> {
         let call_id = call.call_id;
         let caller_id = call.peer_id.clone();
         self.call = Some(call);
-        vec![
+        // Không ai bắt máy thì tick tự decline (405) — nếu không state kẹt ở
+        // Incoming và nuốt mọi cuộc gọi sau (banner đã ẩn từ 45s).
+        let mut out = vec![
             Out::Update { command: "callState".into(), data: json!({"state": "incall"}) },
             Out::Request { command: "getAliasName".into(), data: json!({"noisedId": caller_id}) },
             Out::SendSignal { code: 407, data: json!({"callId": num_json(call_id), "callerId": caller_id}) },
@@ -892,7 +924,9 @@ impl<M: Media> Engine<M> {
                 video,
                 self_avatar: self.self_avatar(),
             }),
-        ]
+        ];
+        out.extend(self.set_deadline(now, RING_TIMEOUT_MS));
+        out
     }
 
     fn peer_ended(&mut self, now: f64) -> Vec<Out> {
