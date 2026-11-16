@@ -342,7 +342,16 @@
         window.__olazLastConv = typeof target === 'string' ? target : (target && (target.id || target.convId));
       } catch (e) {}
       try {
-        scheduleBubbleScan();
+        // Trả `open` về ngay để click vẽ kịp: wrap fetch/XHR (O(1)) chạy
+        // đồng bộ, còn quét DOM (querySelectorAll trên cả hội thoại) dời
+        // sang idle — trước đây nó chặn main thread ngay trong click.
+        wrapFetchOnce();
+        wrapXhrOnce();
+        const run = () => {
+          try { scheduleBubbleScan(); } catch (e) {}
+        };
+        if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(run, { timeout: 1500 });
+        else setTimeout(run, 0);
       } catch (e) {}
       return previous.apply(this, arguments);
     };
@@ -661,7 +670,10 @@
     try {
       const nodes = document.querySelectorAll('[class*=photo-message], [class*=PhotoMessage]');
       for (let n = 0; n < nodes.length; n += 1) {
-        const els = nodes[n].querySelectorAll('*');
+        // Chỉ <img> và phần tử có inline style — tương đương `*` vì
+        // background-image đọc từ `el.style`, nhưng rẻ hơn nhiều khi
+        // photo node chứa cả cây con lớn.
+        const els = nodes[n].querySelectorAll('img,[style]');
         for (let k = 0; k < els.length; k += 1) {
           const el = els[k];
           if (el.tagName === 'IMG' || el.__olazBgSwapped) continue;
@@ -859,7 +871,17 @@
         } catch (e) {}
       }
       // Keep outermost boxes only: drop a node nested inside another hit.
-      nodes = nodes.filter((el, i) => nodes.every((other, j) => i === j || !other.contains(el) || other === el));
+      // (Đi bộ ancestor tuyến tính — bản O(n²) `contains` cũ treo main thread
+      // khi `[data-qId]` khớp mọi bubble trong hội thoại dài.)
+      const hitSet = new Set(nodes);
+      nodes = nodes.filter((el) => {
+        let parent = el.parentElement;
+        while (parent) {
+          if (hitSet.has(parent)) return false;
+          parent = parent.parentElement;
+        }
+        return true;
+      });
       if (!nodes.length) return 0;
       const unmatched = list.slice();
       for (const node of nodes) {
@@ -971,8 +993,11 @@
           });
           const bg = [];
           try {
-            const all = document.querySelectorAll('*');
-            for (let i = 0; i < all.length && bg.length < 3; i += 1) {
+            // Live collection + chặn số phần tử: `querySelectorAll('*')`
+            // cụ thể hoá cả document mỗi lần mở hội thoại không có ảnh.
+            const all = document.getElementsByTagName('*');
+            const limit = Math.min(all.length, 4000);
+            for (let i = 0; i < limit && bg.length < 3; i += 1) {
               const bi = all[i].style && all[i].style.backgroundImage;
               if (bi && /photo|thumb|jxl/i.test(bi)) {
                 bg.push(all[i].tagName + '.' + String(all[i].className).slice(0, 40) + ' ' + bi.slice(0, 90));
