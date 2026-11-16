@@ -342,16 +342,10 @@
         window.__olazLastConv = typeof target === 'string' ? target : (target && (target.id || target.convId));
       } catch (e) {}
       try {
-        // Trả `open` về ngay để click vẽ kịp: wrap fetch/XHR (O(1)) chạy
-        // đồng bộ, còn quét DOM (querySelectorAll trên cả hội thoại) dời
-        // sang idle — trước đây nó chặn main thread ngay trong click.
-        wrapFetchOnce();
-        wrapXhrOnce();
-        const run = () => {
-          try { scheduleBubbleScan(); } catch (e) {}
-        };
-        if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(run, { timeout: 1500 });
-        else setTimeout(run, 0);
+        // Chỉ enqueue: scheduleBubbleScan giờ chỉ tăng generation + đẩy job
+        // vào hàng đợi (không chạm DOM), nên gọi đồng bộ ngay trong click mà
+        // không chặn vẽ; worker nền bơm từng lát ~8ms khi trình duyệt rảnh.
+        scheduleBubbleScan();
       } catch (e) {}
       return previous.apply(this, arguments);
     };
@@ -659,42 +653,128 @@
   // loader holding an error state), so after a conversation opens, rewrite
   // matching images proactively — including the photo viewer modal, whose
   // `<img>` usually carries the same CDN/file URL as the bubble.
-  const proactiveBubbleFix = () => {
-    let fixed = 0;
+  // --------------------------------------- scan worker: hàng đợi + lát idle
+  // Web Worker thật không chạm được DOM, nên "worker riêng" ở đây là một hàng
+  // đợi việc quét chạy nền ngay trong page: mọi querySelector/viết DOM nặng bị
+  // cắt thành lát nhỏ (tối đa ~8 ms/lát) và chỉ bơm khi trình duyệt rảnh
+  // (requestIdleCallback, dự phòng setTimeout). Mỗi lần đổi hội thoại tăng
+  // `scanGen` và đánh dấu việc tồn của conv cũ là stale — click liên tục không
+  // còn dồn quét chồng nhau (bản cũ mỗi click tạo 1 setInterval × 5 đợt quét
+  // đồng bộ, càng click càng treo).
+  const scanQueue = [];
+  let scanScheduled = false;
+  let scanGen = 0;
+  const SCAN_SLICE_MS = 8;
+  const scanIdle = (fn, timeout) => {
     try {
-      const imgs = document.images;
-      for (let k = 0; k < imgs.length; k += 1) {
-        if (swapImgToLocal(imgs[k], 'quét')) fixed += 1;
+      if (typeof window.requestIdleCallback === 'function') {
+        window.requestIdleCallback(() => { try { fn(); } catch (e) {} }, { timeout: timeout || 2000 });
+        return;
       }
     } catch (e) {}
-    try {
-      const nodes = document.querySelectorAll('[class*=photo-message], [class*=PhotoMessage]');
-      for (let n = 0; n < nodes.length; n += 1) {
-        // Chỉ <img> và phần tử có inline style — tương đương `*` vì
-        // background-image đọc từ `el.style`, nhưng rẻ hơn nhiều khi
-        // photo node chứa cả cây con lớn.
-        const els = nodes[n].querySelectorAll('img,[style]');
-        for (let k = 0; k < els.length; k += 1) {
-          const el = els[k];
-          if (el.tagName === 'IMG' || el.__olazBgSwapped) continue;
-          let bi = '';
-          try {
-            bi = el.style && el.style.backgroundImage;
-          } catch (e) {}
-          if (!bi || bi.indexOf('url(') < 0) continue;
-          const m = bi.match(/url\(["']?([^"')]+)["']?\)/);
-          const local = m && localForImgSrc(m[1]);
-          if (!local) continue;
-          el.__olazBgSwapped = true;
-          try {
-            el.style.backgroundImage = 'url("' + local + '")';
-            fixed += 1;
-          } catch (e) {}
-        }
-      }
-    } catch (e) {}
-    return fixed;
+    setTimeout(fn, 0);
   };
+  const pumpScanQueue = () => {
+    scanScheduled = false;
+    try {
+      const deadline = Date.now() + SCAN_SLICE_MS;
+      while (scanQueue.length && Date.now() < deadline) {
+        const job = scanQueue[0];
+        let done = true;
+        try {
+          done = job.stale ? true : job.step(deadline);
+        } catch (e) { done = true; }
+        if (done) scanQueue.shift();
+        else break; // hết lát: nhường main thread, bơm tiếp lượt sau
+      }
+    } catch (e) {}
+    if (scanQueue.length && !scanScheduled) {
+      scanScheduled = true;
+      scanIdle(pumpScanQueue);
+    }
+  };
+  const enqueueScan = (job) => {
+    scanQueue.push(job);
+    if (!scanScheduled) {
+      scanScheduled = true;
+      scanIdle(pumpScanQueue);
+    }
+  };
+  // Thu thập node ảnh: mỗi selector là một pass native — gom một lần trong lát
+  // idle rồi xử lý dần, thay vì vừa query vừa viết DOM trong cùng nhịp click.
+  const collectPhotoNodes = (broad) => {
+    const sels = broad
+      ? [
+        '[class*=photo-message]', '[class*=PhotoMessage]', '[class*=chatImageMessage]',
+        'div[id*=Photo]', 'div[id*=Image]', '[data-qId]',
+      ]
+      : ['[class*=photo-message]', '[class*=PhotoMessage]'];
+    let nodes = [];
+    for (const sel of sels) {
+      try {
+        nodes = nodes.concat(Array.from(document.querySelectorAll(sel)));
+      } catch (e) {}
+    }
+    // Giữ box ngoài cùng: đi bộ ancestor tuyến tính (bản O(n²) `contains` cũ
+    // treo main thread khi `[data-qId]` khớp mọi bubble trong hội thoại dài).
+    const hitSet = new Set(nodes);
+    return nodes.filter((el) => {
+      let parent = el.parentElement;
+      while (parent) {
+        if (hitSet.has(parent)) return false;
+        parent = parent.parentElement;
+      }
+      return true;
+    });
+  };
+  // Job sửa <img> + background về cache local, cắt lát theo deadline.
+  const makeProactiveJob = (gen) => {
+    const st = { phase: 0, imgs: null, ix: 0, nodes: null, nx: 0 };
+    return {
+      step(deadline) {
+        if (gen !== scanGen) return true;
+        if (st.phase === 0) {
+          try {
+            if (!st.imgs) { st.imgs = Array.from(document.images); st.ix = 0; }
+            while (st.ix < st.imgs.length && Date.now() < deadline) {
+              swapImgToLocal(st.imgs[st.ix], 'quét');
+              st.ix += 1;
+            }
+            if (st.ix < st.imgs.length) return false;
+          } catch (e) {}
+          st.phase = 1;
+        }
+        if (st.phase === 1) {
+          try {
+            if (!st.nodes) { st.nodes = collectPhotoNodes(false); st.nx = 0; }
+            while (st.nx < st.nodes.length && Date.now() < deadline) {
+              const root = st.nodes[st.nx];
+              st.nx += 1;
+              let els = null;
+              try { els = root.querySelectorAll('img,[style]'); } catch (e) {}
+              if (!els) continue;
+              for (let k = 0; k < els.length; k += 1) {
+                const el = els[k];
+                if (el.tagName === 'IMG' || el.__olazBgSwapped) continue;
+                let bi = '';
+                try { bi = el.style && el.style.backgroundImage; } catch (e) {}
+                if (!bi || bi.indexOf('url(') < 0) continue;
+                const m = bi.match(/url\(["']?([^"')]+)["']?\)/);
+                const local = m && localForImgSrc(m[1]);
+                if (!local) continue;
+                el.__olazBgSwapped = true;
+                try { el.style.backgroundImage = 'url("' + local + '")'; } catch (e) {}
+              }
+            }
+            if (st.nx < st.nodes.length) return false;
+          } catch (e) {}
+          st.phase = 2;
+        }
+        return true;
+      },
+    };
+  };
+
   // Own lightbox: the official viewer renders in an Electron child window
   // (`photoviewer_popup_mode == 2` → `/popup-viewer.html`), which this host
   // does not have, so a thumbnail click did nothing. Open our own overlay:
@@ -853,114 +933,121 @@
   // cannot decode, or a `file://` read WebKitGTK blocks): paint our warmed
   // JPEG into the bubble box directly. Matching prefers a cliMsgId found in
   // the bubble's own attributes, and falls back to message order.
-  const injectBubblePhotos = (convId) => {
-    let injected = 0;
-    try {
-      const list = convPhotoLists[convId] || [];
-      if (!list.length) return 0;
-      const byCli = {};
-      for (const it of list) byCli[it.cli] = it;
-      const sels = [
-        '[class*=photo-message]', '[class*=PhotoMessage]', '[class*=chatImageMessage]',
-        'div[id*=Photo]', 'div[id*=Image]', '[data-qId]',
-      ];
-      let nodes = [];
-      for (const sel of sels) {
-        try {
-          nodes = nodes.concat(Array.from(document.querySelectorAll(sel)));
-        } catch (e) {}
-      }
-      // Keep outermost boxes only: drop a node nested inside another hit.
-      // (Đi bộ ancestor tuyến tính — bản O(n²) `contains` cũ treo main thread
-      // khi `[data-qId]` khớp mọi bubble trong hội thoại dài.)
-      const hitSet = new Set(nodes);
-      nodes = nodes.filter((el) => {
-        let parent = el.parentElement;
-        while (parent) {
-          if (hitSet.has(parent)) return false;
-          parent = parent.parentElement;
-        }
-        return true;
-      });
-      if (!nodes.length) return 0;
-      const unmatched = list.slice();
-      for (const node of nodes) {
-        try {
-          if (node.__olazInjected) continue;
-          let html = '';
+  // Job tự vẽ thumbnail từ cache vào bubble chưa có pixel, cắt lát ~25 node/lần
+  // để insertBefore không dồn layout trong một nhịp.
+  const makeInjectJob = (convId, gen) => {
+    const st = { phase: 0, nodes: null, nx: 0, byCli: null, unmatched: null, injected: 0 };
+    return {
+      step(deadline) {
+        if (gen !== scanGen || window.__olazLastConv !== convId) return true;
+        if (st.phase === 0) {
           try {
-            html = (node.id || '') + ' ' + (node.getAttribute('data-id') || '') + ' ' +
-              (node.getAttribute('data-qid') || node.getAttribute('data-qId') || '');
-          } catch (e) {}
-          let item = null;
-          const m = String(html).match(/(\d{8,})/);
-          if (m && byCli[m[1]]) {
-            item = byCli[m[1]];
-            const ix = unmatched.indexOf(item);
-            if (ix >= 0) unmatched.splice(ix, 1);
-          } else if (unmatched.length) {
-            // Bubbles mount in message order; consume the next photo.
-            item = unmatched.shift();
+            const list = convPhotoLists[convId] || [];
+            if (!list.length) return true;
+            st.byCli = {};
+            for (const it of list) st.byCli[it.cli] = it;
+            st.unmatched = list.slice();
+            st.nodes = collectPhotoNodes(true);
+            st.nx = 0;
+          } catch (e) { return true; }
+          st.phase = 1;
+        }
+        try {
+          let n = 0;
+          while (st.nx < st.nodes.length && Date.now() < deadline && n < 25) {
+            const node = st.nodes[st.nx];
+            st.nx += 1;
+            n += 1;
+            try {
+              if (node.__olazInjected) continue;
+              let html = '';
+              try {
+                html = (node.id || '') + ' ' + (node.getAttribute('data-id') || '') + ' ' +
+                  (node.getAttribute('data-qid') || node.getAttribute('data-qId') || '');
+              } catch (e) {}
+              let item = null;
+              const m = String(html).match(/(\d{8,})/);
+              if (m && st.byCli[m[1]]) {
+                item = st.byCli[m[1]];
+                const ix = st.unmatched.indexOf(item);
+                if (ix >= 0) st.unmatched.splice(ix, 1);
+              } else if (st.unmatched.length) {
+                // Bubbles mount in message order; consume the next photo.
+                item = st.unmatched.shift();
+              }
+              if (!item) continue;
+              const healthy = Array.from(node.querySelectorAll('img')).some((im) => im.naturalWidth > 1);
+              if (healthy) continue;
+              const box = node.querySelector('.chat-message-picture__error, [class*=photooverlay], [class*=bg-color]') || node;
+              const img = document.createElement('img');
+              img.src = item.local;
+              img.alt = 'photo';
+              img.setAttribute(
+                'style',
+                'width:100%;height:100%;max-width:320px;max-height:320px;' +
+                  'object-fit:cover;border-radius:6px;display:block;cursor:zoom-in;',
+              );
+              img.addEventListener('click', (ev) => {
+                try { ev.stopPropagation(); } catch (e) {}
+                openOlazLightbox(item.local, item.cli);
+              });
+              try { box.insertBefore(img, box.firstChild); } catch (e) { box.appendChild(img); }
+              node.__olazInjected = true;
+              st.injected += 1;
+            } catch (e) {}
           }
-          if (!item) continue;
-          const healthy = Array.from(node.querySelectorAll('img')).some((im) => im.naturalWidth > 1);
-          if (healthy) continue;
-          let box = node.querySelector('.chat-message-picture__error, [class*=photooverlay], [class*=bg-color]') || node;
-          const img = document.createElement('img');
-          img.src = item.local;
-          img.alt = 'photo';
-          img.setAttribute(
-            'style',
-            'width:100%;height:100%;max-width:320px;max-height:320px;' +
-              'object-fit:cover;border-radius:6px;display:block;cursor:zoom-in;',
-          );
-          img.addEventListener('click', (ev) => {
-            try { ev.stopPropagation(); } catch (e) {}
-            openOlazLightbox(item.local, item.cli);
-          });
-          try { box.insertBefore(img, box.firstChild); } catch (e) { box.appendChild(img); }
-          node.__olazInjected = true;
-          injected += 1;
+          if (st.nx < st.nodes.length) return false;
         } catch (e) {}
-      }
-    } catch (e) {}
-    return injected;
+        if (st.injected) report('bubble: tự vẽ ' + st.injected + ' thumbnail từ cache (' + convId + ')');
+        return true;
+      },
+    };
   };
   // Passive check, so a headless run can still tell whether thumbnails paint:
   // a few seconds after a conversation opens, count its bubble images that
   // decoded (naturalWidth > 1) versus the ones still blank.
-  const scheduleBubbleScan = () => {
-    // Fix first, then measure: bubbles mount lazily while scrolling, so sweep
-    // a few times and only report the final painted state.
-    try {
-      wrapFetchOnce();
-      wrapXhrOnce();
-      proactiveBubbleFix();
-    } catch (e) {}
-    const convId = window.__olazLastConv;
-    if (convId) {
-      try {
-        const n = injectBubblePhotos(convId);
-        if (n) report('bubble: tự vẽ ' + n + ' thumbnail từ cache (' + convId + ')');
-      } catch (e) {}
-    }
-    let sweep = 0;
-    const sweeper = setInterval(() => {
-      try {
-        wrapFetchOnce();
-        wrapXhrOnce();
-        proactiveBubbleFix();
-        retriggerWedgedImages();
-        if (convId) injectBubblePhotos(convId);
-      } catch (e) {}
-      sweep += 1;
-      if (sweep >= 5) {
-        try {
-          clearInterval(sweeper);
-        } catch (e) {}
-      }
-    }, 3000);
+  // Một lần mở hội thoại = proactive rồi inject, chạy nối tiếp trong hàng đợi.
+  const makeOpenScanJob = (convId, gen) => {
+    const pro = makeProactiveJob(gen);
+    const inj = makeInjectJob(convId, gen);
+    return {
+      step(deadline) {
+        if (gen !== scanGen || window.__olazLastConv !== convId) return true;
+        if (!pro.step(deadline)) return false;
+        if (Date.now() >= deadline) return false;
+        return inj.step(deadline);
+      },
+    };
+  };
+  // Đợt quét lại sau khi mở (bubbles mount lazy khi cuộn): proactive + inject
+  // + gỡ ảnh kẹt, cũng chạy trong hàng đợi thay vì setInterval đồng bộ.
+  const makeSweepJob = (convId, gen) => {
+    const inner = makeOpenScanJob(convId, gen);
+    let tailed = false;
+    return {
+      step(deadline) {
+        if (!inner.step(deadline)) return false;
+        if (!tailed) {
+          tailed = true;
+          try { retriggerWedgedImages(); } catch (e) {}
+        }
+        return true;
+      },
+    };
+  };
+  // Timer chỉ enqueue job (không chạm DOM), nên click tiếp theo vẫn nhẹ.
+  const scheduleSweeps = (convId, gen, left) => {
+    if (left <= 0 || !convId) return;
     setTimeout(() => {
+      if (gen !== scanGen || window.__olazLastConv !== convId) return;
+      enqueueScan(makeSweepJob(convId, gen));
+      scheduleSweeps(convId, gen, left - 1);
+    }, 3000);
+  };
+  // Báo cáo thụ động: đếm bubble đã hiện hình sau khi mở, chạy nền một lát.
+  const makeDiagJob = (convId, gen) => ({
+    step() {
+      if (gen !== scanGen) return true;
       try {
         const nodes = document.querySelectorAll('[class*=photo-message], [class*=PhotoMessage]');
         const imgs = Array.from(document.querySelectorAll('[class*=photo-message] img, [class*=PhotoMessage] img')).slice(0, 12);
@@ -1025,8 +1112,29 @@
           }, 90000);
         } catch (e) {}
       } catch (e) {}
+      return true;
+    },
+  });
+  // Entry point khi mở hội thoại: chỉ tăng generation + enqueue (không chạm
+  // DOM), nên gọi đồng bộ ngay trong click mà không chặn vẽ.
+  const scheduleBubbleScan = () => {
+    try {
+      wrapFetchOnce();
+      wrapXhrOnce();
+    } catch (e) {}
+    const convId = window.__olazLastConv;
+    scanGen += 1;
+    const gen = scanGen;
+    // Huỷ việc tồn của conv cũ: click liên tục không dồn quét chồng nhau.
+    for (const job of scanQueue) job.stale = true;
+    if (convId) enqueueScan(makeOpenScanJob(convId, gen));
+    else enqueueScan(makeProactiveJob(gen));
+    scheduleSweeps(convId, gen, 5);
+    setTimeout(() => {
+      if (gen === scanGen) enqueueScan(makeDiagJob(convId, gen));
     }, 7000);
   };
+
 
   // ---------------------------------------------------------------- reporting
   // A webview that stalls has nowhere to say so: send page errors and the
