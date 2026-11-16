@@ -96,29 +96,16 @@
       };
       read.onsuccess = () => {
         const rows = read.result || [];
+        let ix = 0;
         let seen = 0;
         let fixed = 0;
-        const tx = db.transaction('message', 'readwrite');
-        const store = tx.objectStore('message');
-        rows.forEach((row) => {
-          const body = row && row.message;
-          if (typeof body !== 'string' || body.length < 2) return;
-          seen += 1;
-          let value = body;
-          try {
-            value = JSON.parse(xorUin(body));
-          } catch (e) {}
-          // Định dạng chính thức: giá trị sau reveal; encode lại trọn vẹn nên
-          // row ciphertext giữ nguyên (idempotent) và row plaintext được sửa.
-          const target = xorUin(JSON.stringify(value));
-          if (target !== body) {
-            row.message = target;
-            store.put(row);
-            fixed += 1;
-          }
-        });
-        tx.oncomplete = () => {
-          db.close();
+        // Store hàng trăm nghìn dòng: XOR từng ký tự + JSON.parse toàn bộ
+        // trong một nhịp sẽ khóa main thread nhiều giây — đúng lúc user click
+        // conv thì bubble không vẽ được. Chia lát ~1000 dòng/transaction, mỗi
+        // lát xong nhường event loop để click/paint chen vào; transaction mở
+        // riêng mỗi lát vì IndexedDB tự commit khi nhường nhịp.
+        const finish = () => {
+          try { db.close(); } catch (e) {}
           report('decrypt: ' + fixed + '/' + seen + ' dòng đã chuẩn hoá (' + rows.length + ' dòng trong store)');
           // The photo warmer needs the decoded `params`: chain it here instead
           // of a fixed delay so a slow repair still feeds the cache pass.
@@ -129,12 +116,45 @@
             void warmPhotoCaches(userId);
           } catch (e) {}
         };
-        tx.onerror = () => {
-          report('decrypt: ghi DB lỗi ' + (tx.error && tx.error.message));
+        const step = () => {
+          let tx;
           try {
-            db.close();
-          } catch (e) {}
+            tx = db.transaction('message', 'readwrite');
+            const store = tx.objectStore('message');
+            const end = Math.min(ix + 1000, rows.length);
+            for (; ix < end; ix += 1) {
+              const row = rows[ix];
+              const body = row && row.message;
+              if (typeof body !== 'string' || body.length < 2) continue;
+              seen += 1;
+              let value = body;
+              try {
+                value = JSON.parse(xorUin(body));
+              } catch (e) {}
+              // Định dạng chính thức: giá trị sau reveal; encode lại trọn vẹn nên
+              // row ciphertext giữ nguyên (idempotent) và row plaintext được sửa.
+              const target = xorUin(JSON.stringify(value));
+              if (target !== body) {
+                row.message = target;
+                store.put(row);
+                fixed += 1;
+              }
+            }
+          } catch (e) {
+            try { db.close(); } catch (_) {}
+            return;
+          }
+          tx.oncomplete = () => {
+            if (ix < rows.length) setTimeout(step, 0);
+            else finish();
+          };
+          tx.onerror = () => {
+            report('decrypt: ghi DB lỗi ' + (tx.error && tx.error.message));
+            try { db.close(); } catch (e) {}
+          };
         };
+        if (!rows.length) finish();
+        else step();
       };
     };
   };
@@ -320,14 +340,11 @@
         'photo cache: ' + (downloaded + present) + '/' + targets.length + ' (' + downloaded +
           ' tải, ' + present + ' có sẵn, ' + failed + ' lỗi)',
       );
-      // The component probes the cache once, when the bubble mounts: remount the
-      // conversation that is open so photos that just landed leave their LQIP.
-      const conv = window.__olazLastConv;
-      if (downloaded > 0 && conv && window.__zaloChat && typeof window.__zaloChat.open === 'function') {
-        try {
-          window.__zaloChat.open({ id: conv });
-        } catch (e) {}
-      }
+      // Không remount hội thoại đang mở: gọi lại `chat.open` là reload toàn
+      // bộ conv (đọc history + render lại từ đầu) — chính là cú "chờ một lúc"
+      // mỗi khi click conv trùng lúc warmer vừa tải xong. Ảnh mới tải đã có
+      // inject job tự vẽ vào bubble + listener `error` tự swap, không cần mở
+      // lại hội thoại.
     } catch (err) {
       report('photo cache lỗi: ' + err);
     }
@@ -717,7 +734,12 @@
       try {
         nodes = nodes.concat(Array.from(document.querySelectorAll(sel)));
       } catch (e) {}
+      // Chặn trần để một pass thu thập trong hội thoại rất dài không nuốt
+      // trọn lát idle ngay trước first paint; bubbles lazy-mount khi cuộn
+      // được các đợt sweep sau + observer bao phủ tiếp.
+      if (nodes.length >= 1200) break;
     }
+    if (nodes.length > 1200) nodes = nodes.slice(0, 1200);
     // Giữ box ngoài cùng: đi bộ ancestor tuyến tính (bản O(n²) `contains` cũ
     // treo main thread khi `[data-qId]` khớp mọi bubble trong hội thoại dài).
     const hitSet = new Set(nodes);
@@ -1130,8 +1152,14 @@
     const gen = scanGen;
     // Huỷ việc tồn của conv cũ: click liên tục không dồn quét chồng nhau.
     for (const job of scanQueue) job.stale = true;
-    if (convId) enqueueScan(makeOpenScanJob(convId, gen));
-    else enqueueScan(makeProactiveJob(gen));
+    // Bubble trước, content sau: hoãn job quét/sửa ảnh ~400ms để React vẽ
+    // xong khung bubble (first paint) rồi mới tới lượt content điền vào qua
+    // các lát idle; click conv khác trong lúc chờ thì gen mới huỷ job này.
+    if (convId) {
+      setTimeout(() => {
+        if (gen === scanGen && window.__olazLastConv === convId) enqueueScan(makeOpenScanJob(convId, gen));
+      }, 400);
+    } else enqueueScan(makeProactiveJob(gen));
     scheduleSweeps(convId, gen, 5);
     setTimeout(() => {
       if (gen === scanGen) enqueueScan(makeDiagJob(convId, gen));
