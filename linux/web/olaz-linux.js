@@ -685,6 +685,9 @@
           done = job.stale ? true : job.step(deadline);
         } catch (e) { done = true; }
         if (done) scanQueue.shift();
+        // Round-robin: job chưa xong nhường lượt cho job khác (rewrite dồn
+        // dập lúc zoom không được chặn job quét conv), bơm tiếp lượt sau.
+        else if (scanQueue.length > 1) scanQueue.push(scanQueue.shift());
         else break; // hết lát: nhường main thread, bơm tiếp lượt sau
       }
     } catch (e) {}
@@ -1265,11 +1268,59 @@
     rewriteNode(root);
     if (root.querySelectorAll) root.querySelectorAll('[src],[poster],[style]').forEach(rewriteNode);
   };
-  new MutationObserver((records) => {
-    for (const record of records) {
-      if (record.type === 'attributes') rewriteNode(record.target);
-      else for (const node of record.addedNodes) if (node.nodeType === 1) rewriteTree(node);
+  // Zoom/resize làm React render lại hàng loạt: hàng trăm subtree được thêm
+  // cùng lúc, mỗi cái `rewriteTree` đồng bộ sẽ cộng dồn thành treo main
+  // thread. Chỉ sửa node gốc + attribute ngay (giữ cuộc đua file://→local
+  // cho trường hợp thường gặp), còn đi bộ descendant dồn vào hàng đợi quét
+  // nền cắt lát theo deadline. Trường hợp xấu (ảnh file:// nằm sâu trong
+  // descendant) vẫn được cứu bởi listener `error` (swapImgToLocal) và các
+  // đợt sweep sau khi mở conv.
+  const pendingRewriteRoots = new Set();
+  const makeRewriteJob = () => ({
+    step(deadline) {
+      try {
+        while (pendingRewriteRoots.size) {
+          if (Date.now() >= deadline) return false;
+          const root = pendingRewriteRoots.values().next().value;
+          pendingRewriteRoots.delete(root);
+          // Root con của một root khác đang chờ: root cha sẽ quét phủ nó.
+          let p = root.parentElement;
+          let covered = false;
+          while (p) {
+            if (pendingRewriteRoots.has(p)) { covered = true; break; }
+            p = p.parentElement;
+          }
+          if (covered) continue;
+          try {
+            if (root.isConnected) rewriteTree(root);
+          } catch (e) {}
+        }
+      } catch (e) {}
+      return true;
+    },
+  });
+  const enqueueRewriteRoots = (roots) => {
+    let need = false;
+    for (const node of roots) {
+      if (!pendingRewriteRoots.has(node)) { pendingRewriteRoots.add(node); need = true; }
     }
+    if (need) enqueueScan(makeRewriteJob());
+  };
+  new MutationObserver((records) => {
+    try {
+      let added = null;
+      for (const record of records) {
+        if (record.type === 'attributes') rewriteNode(record.target);
+        else {
+          for (const node of record.addedNodes) {
+            if (node.nodeType !== 1) continue;
+            rewriteNode(node);
+            (added || (added = [])).push(node);
+          }
+        }
+      }
+      if (added) enqueueRewriteRoots(added);
+    } catch (e) {}
   }).observe(document.documentElement || document, {
     subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'poster', 'style'],
   });
