@@ -354,6 +354,9 @@
   let callPanel = null;
   let callTimerInterval = null;
   let callConnectedAt = null;
+  // Cuộc gọi còn sống hay không — frame video tới muộn sau `free` không được
+  // dựng lại panel rỗng (không status, không nút, kẹt tới cuộc sau).
+  let callLive = false;
 
   const fmtDuration = (ms) => {
     const s = Math.floor(ms / 1000);
@@ -366,6 +369,7 @@
     clearInterval(callTimerInterval);
     callTimerInterval = null;
     callConnectedAt = null;
+    callLive = false;
     callPanel?.remove();
     callPanel = null;
   };
@@ -415,6 +419,7 @@
   const onCallUi = (data) => {
     if (!data || typeof data !== 'object') return;
     if (data.state === 'free') return hideCallPanel();
+    callLive = true;
     if (data.state === 'incall') return; // banner đã hiển thị từ renderer
     if (typeof data.status === 'string') {
       const text = {
@@ -438,7 +443,7 @@
   // Ảnh bên kia (engine gửi `call-video` ~2 fps khi peer phát video).
   const onCallVideo = (data) => {
     const jpeg = data && typeof data.jpeg === 'string' ? data.jpeg : '';
-    if (!jpeg) return;
+    if (!jpeg || !callLive) return;
     showCallPanel();
     let img = callPanel.querySelector('.olaz-call-video');
     if (!img) {
